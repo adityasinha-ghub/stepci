@@ -53,6 +53,34 @@ pub fn evaluate(src: &str, ctx: &Context) -> Result<Value> {
     eval(&ast, ctx)
 }
 
+/// Whether an expression *calls* a status function (`success`/`failure`/
+/// `cancelled`/`always`), used to decide the implicit `success()` wrap on `if:`.
+///
+/// This walks the parsed AST, so a string literal like `'always()'` or a property
+/// name like `steps.success.outputs` is correctly *not* counted — unlike a
+/// substring scan.
+pub fn references_status_function(src: &str) -> Result<bool> {
+    let tokens = lex(src)?;
+    let mut parser = Parser::new(tokens);
+    let ast = parser.parse_expr()?;
+    parser.expect_eof()?;
+    Ok(ast_calls_status(&ast))
+}
+
+fn ast_calls_status(ast: &Ast) -> bool {
+    match ast {
+        Ast::Call(name, args) => {
+            matches!(
+                name.to_ascii_lowercase().as_str(),
+                "success" | "failure" | "cancelled" | "always"
+            ) || args.iter().any(ast_calls_status)
+        }
+        Ast::Not(e) | Ast::Property(e, _) | Ast::Star(e) => ast_calls_status(e),
+        Ast::Index(a, b) | Ast::Binary(_, a, b) => ast_calls_status(a) || ast_calls_status(b),
+        _ => false,
+    }
+}
+
 /// Interpolate a template: literal text is kept verbatim, and each `${{ … }}`
 /// span is evaluated and replaced with its string coercion.
 pub fn interpolate(template: &str, ctx: &Context) -> Result<String> {

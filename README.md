@@ -3,9 +3,12 @@
 [![CI](https://github.com/adityasinha-ghub/stepci/actions/workflows/ci.yml/badge.svg)](https://github.com/adityasinha-ghub/stepci/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-> ⚠️ **Status: early — scaffold only.** The command surface exists; the workflow
-> executor is not built yet. This README describes where it's going and is honest
-> about what does and doesn't work today. See [Roadmap](#roadmap).
+> ⚠️ **Status: early — works, but incomplete.** `stepci run` now *executes* a
+> workflow's `run:` steps natively — evaluating `if:` conditions, interpolating
+> `${{ }}`, and propagating `$GITHUB_ENV`/`$GITHUB_OUTPUT` between steps. The
+> per-step **diff**, the interactive **debugger** (pause/shell), and **secret
+> managers** are not built yet. This README is honest about that. See
+> [Roadmap](#roadmap).
 
 **A native, Dockerless debugger for GitHub Actions — step through a workflow run
 on your own machine, see exactly what each step changed, using your real secrets.**
@@ -14,13 +17,25 @@ You edit a workflow, push, wait for CI, read the log, guess, and push again.
 Twelve "fix CI" commits later it goes green. `stepci` collapses that loop: run
 the workflow locally, pause between steps, and inspect *what actually happened*.
 
+**Today** — it runs the workflow natively and reports each step:
+
 ```bash
-# (planned interface)
 stepci run .github/workflows/ci.yml
 ```
 
 ```
-● job: test  (ubuntu-latest, native)
+● job build (build)
+  ▸ step 2: Interpolation + workflow env …
+hello from macOS / main
+  ✓ step 2 ok
+  ▸ step 4: Soft failure …
+  ⚠ step 4 failed (exit 3) — continue-on-error
+```
+
+**Where it's going** — pause between steps and show exactly what each one changed:
+
+```
+● job: test  (native)
   ▸ step 2/6  "Install deps"   run: npm ci
     ⏸ paused — [c]ontinue  [s]hell  [d]iff  [q]uit
 
@@ -83,7 +98,7 @@ as the executor needs them:
 
 - **Duplicate keys** (two jobs/steps/env entries with the same name) are silently
   last-wins; GitHub rejects them.
-- **`needs`** is not cross-checked, so a reference to a non-existent job parses.
+- **`needs`** referencing an undefined job parses, but is rejected at run time.
 - **Norway problem:** unquoted `yes`/`no`/`on`/`off` are treated as strings in
   `env`/`with` values (YAML 1.2), whereas GitHub reads them as booleans (YAML
   1.1). This *is* handled for boolean-typed fields like `continue-on-error`;
@@ -107,11 +122,23 @@ the common functions. Deferred or approximate:
 - Case-insensitive string ops use ASCII folding (matching the runner's ordinal
   comparison), not full Unicode folding.
 
+### Known executor gaps (v0)
+
+- **`uses:` steps are skipped** — native action execution (Docker/JS/composite) is
+  not implemented; they're reported, not run.
+- **Native execution inherits your host environment** and runs on your host OS
+  (`runs-on` is informational). Convenient, but not a hermetic Ubuntu runner.
+- **`secrets` are empty**, and `matrix`, service containers, and artifacts are not
+  supported yet.
+- The `github` context is populated best-effort from local git (`sha`, `ref`,
+  `ref_name`) with `event_name` defaulting to `push`.
+- `$GITHUB_ENV`/`$GITHUB_OUTPUT` files are read without a size cap.
+
 ## Roadmap
 
 - [x] Workflow parser (jobs, steps, `run:`/`uses:`) with located, actionable errors
 - [x] `${{ }}` expression evaluator (operators, coercion, functions, interpolation)
-- [ ] Native step executor (shell + env propagation, working dir, exit codes)
+- [x] Native step executor (`run:` steps: shell, env/output/path propagation, `if:`, `continue-on-error`, job order)
 - [ ] Per-step environment **diff**
 - [ ] Per-step filesystem **diff**
 - [ ] Interactive debugger loop (pause / shell / continue / quit)

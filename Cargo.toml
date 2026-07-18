@@ -20,6 +20,8 @@ serde_yaml = "0.9"
 indexmap = { version = "2", features = ["serde"] }
 # For toJSON/fromJSON expression functions; preserve_order keeps object key order.
 serde_json = { version = "1", features = ["preserve_order"] }
+# Temp files for step scripts and the GITHUB_ENV/OUTPUT/PATH channels.
+tempfile = "3"
 
 [profile.release]
 strip = true

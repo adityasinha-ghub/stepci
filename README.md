@@ -91,10 +91,26 @@ as the executor needs them:
 - Non-string `run:` bodies and non-string map keys are coerced rather than
   rejected.
 
+### Known expression gaps (v0)
+
+The `${{ }}` evaluator is faithful to the runner for operators, coercion,
+equality (case-insensitive strings; reference-inequality for arrays/objects), and
+the common functions. Deferred or approximate:
+
+- **Object filters** (`.*`) and **`hashFiles()`** are not implemented — they error
+  clearly rather than returning a wrong value.
+- **Number → string** formatting approximates GitHub's `G15`; it can differ for
+  values with >15 significant digits or ones GitHub prints in exponent form
+  (uncommon, since the language has no arithmetic).
+- **Hex** string coercion uses 64-bit range; GitHub's is 32-bit, so very large
+  hex strings differ.
+- Case-insensitive string ops use ASCII folding (matching the runner's ordinal
+  comparison), not full Unicode folding.
+
 ## Roadmap
 
 - [x] Workflow parser (jobs, steps, `run:`/`uses:`) with located, actionable errors
-- [ ] `${{ }}` expression evaluator + standard contexts
+- [x] `${{ }}` expression evaluator (operators, coercion, functions, interpolation)
 - [ ] Native step executor (shell + env propagation, working dir, exit codes)
 - [ ] Per-step environment **diff**
 - [ ] Per-step filesystem **diff**

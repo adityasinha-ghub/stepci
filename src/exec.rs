@@ -7,7 +7,7 @@
 //! action execution is deferred). Output streams straight through to the terminal.
 
 use std::collections::HashSet;
-use std::io::Write;
+use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -31,6 +31,17 @@ pub struct RunOptions {
     /// The working directory used as `github.workspace` and the base for
     /// relative `working-directory`.
     pub workspace: PathBuf,
+    /// Pause before every step (interactive step-through).
+    pub step_all: bool,
+    /// Pause before steps whose id is in this list.
+    pub breakpoints: Vec<String>,
+}
+
+/// What to do after a step: keep going, or the user asked to quit the run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Flow {
+    Continue,
+    Quit,
 }
 
 /// The outcome of a whole job.
@@ -51,6 +62,15 @@ pub fn run_workflow(wf: &Workflow, opts: &RunOptions) -> Result<i32> {
     // In single-job mode we don't run `needs`, so don't gate on them.
     let single = opts.job.is_some();
 
+    // Pausing needs a real terminal to read commands from.
+    let pausing_requested = opts.step_all || !opts.breakpoints.is_empty();
+    let interactive = pausing_requested && std::io::stdin().is_terminal();
+    if pausing_requested && !interactive {
+        eprintln!("note: stdin is not a terminal — running without pausing.");
+    }
+    warn_unknown_breakpoints(wf, opts);
+
+    let mut quit = false;
     let mut results: IndexMap<String, JobResult> = IndexMap::new();
     for id in &order {
         let job = &wf.jobs[id];
@@ -84,17 +104,48 @@ pub fn run_workflow(wf: &Workflow, opts: &RunOptions) -> Result<i32> {
             continue;
         }
 
-        let status = run_job(job, wf, &github, &runner, opts)?;
+        let (status, flow) = run_job(job, wf, &github, &runner, opts, interactive)?;
         let result = if status == JobStatus::Success {
             JobResult::Success
         } else {
             JobResult::Failed
         };
         results.insert(id.clone(), result);
+        if flow == Flow::Quit {
+            println!("\n(quit — remaining jobs not run)");
+            quit = true;
+            break;
+        }
     }
 
+    // A real failure outranks a user quit; a clean quit is reported as 130
+    // (interrupted) so it isn't mistaken for success.
     let failed = results.values().any(|r| *r == JobResult::Failed);
-    Ok(if failed { 1 } else { 0 })
+    Ok(if failed {
+        1
+    } else if quit {
+        130
+    } else {
+        0
+    })
+}
+
+/// Warn once about `--break` ids that match no step, so a typo isn't silent.
+fn warn_unknown_breakpoints(wf: &Workflow, opts: &RunOptions) {
+    if opts.breakpoints.is_empty() {
+        return;
+    }
+    let known: HashSet<&str> = wf
+        .jobs
+        .values()
+        .flat_map(|j| j.steps.iter())
+        .filter_map(|s| s.id.as_deref())
+        .collect();
+    for bp in &opts.breakpoints {
+        if !known.contains(bp.as_str()) {
+            eprintln!("note: no step has id `{bp}` — that breakpoint will never fire.");
+        }
+    }
 }
 
 /// Reject a `needs` that references a job the workflow doesn't define — GitHub
@@ -171,7 +222,8 @@ fn run_job(
     github: &Value,
     runner: &Value,
     opts: &RunOptions,
-) -> Result<JobStatus> {
+    interactive: bool,
+) -> Result<(JobStatus, Flow)> {
     let label = job.name.as_deref().unwrap_or(&job.id);
     println!("\n● job {} ({label})", job.id);
 
@@ -188,11 +240,24 @@ fn run_job(
     layer_env(&mut state, &job.env, github, runner)?;
 
     for (i, step) in job.steps.iter().enumerate() {
-        run_step(step, i + 1, &mut state, job, wf, github, runner, opts)
-            .with_context(|| format!("in step {}", i + 1))?;
+        let flow = run_step(
+            step,
+            i + 1,
+            &mut state,
+            job,
+            wf,
+            github,
+            runner,
+            opts,
+            interactive,
+        )
+        .with_context(|| format!("in step {}", i + 1))?;
+        if flow == Flow::Quit {
+            return Ok((state.status, Flow::Quit));
+        }
     }
 
-    Ok(state.status)
+    Ok((state.status, Flow::Continue))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -205,7 +270,8 @@ fn run_step(
     github: &Value,
     runner: &Value,
     opts: &RunOptions,
-) -> Result<()> {
+    interactive: bool,
+) -> Result<Flow> {
     // Step env is layered over the job env for this step only.
     let mut step_env = state.env.clone();
     let ctx0 = make_context(&step_env, github, runner, &state.steps, state.status);
@@ -226,7 +292,7 @@ fn run_step(
     if !should_run {
         println!("skipped (if condition false)");
         record_step(state, step, "skipped", "skipped", IndexMap::new());
-        return Ok(());
+        return Ok(Flow::Continue);
     }
 
     let script = match &step.action {
@@ -234,7 +300,7 @@ fn run_step(
         StepAction::Uses { action, .. } => {
             println!("skipped (uses: `{action}` — native actions not supported in v0)");
             record_step(state, step, "skipped", "skipped", IndexMap::new());
-            return Ok(());
+            return Ok(Flow::Continue);
         }
     };
 
@@ -247,6 +313,31 @@ fn run_step(
         .unwrap_or("bash");
     let cwd = resolve_cwd(step, job, wf, &opts.workspace);
 
+    println!(); // end the "… " header line
+
+    // Interactive pause before running this step.
+    if interactive && should_pause_at(step, opts) {
+        match pause_before(
+            number,
+            &label,
+            shell,
+            &script,
+            &cwd,
+            &step_env,
+            &state.path,
+            github,
+            runner,
+        )? {
+            Decision::Run => {}
+            Decision::Skip => {
+                println!("  ⤼ step {number} skipped by request");
+                record_step(state, step, "skipped", "skipped", IndexMap::new());
+                return Ok(Flow::Continue);
+            }
+            Decision::Quit => return Ok(Flow::Quit),
+        }
+    }
+
     // Channel files the step writes back through.
     let env_file = NamedTempFile::new().context("creating GITHUB_ENV file")?;
     let out_file = NamedTempFile::new().context("creating GITHUB_OUTPUT file")?;
@@ -258,7 +349,6 @@ fn run_step(
     let path_before = state.path.clone();
     let fs_before = diff::snapshot_fs(&opts.workspace, MAX_DIFF_FILES);
 
-    println!(); // end the "… " line before the step's own output streams
     let status = spawn_step(
         shell,
         &script,
@@ -316,6 +406,102 @@ fn run_step(
         (false, _) => println!("  ✗ step {number} failed (exit {code})"),
     }
     print_diff(&env_delta, &fs_delta);
+    Ok(Flow::Continue)
+}
+
+/// Whether to pause before this step, given the run's flags.
+fn should_pause_at(step: &Step, opts: &RunOptions) -> bool {
+    opts.step_all
+        || step
+            .id
+            .as_ref()
+            .is_some_and(|id| opts.breakpoints.iter().any(|b| b == id))
+}
+
+/// What the user chose at a pause prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Decision {
+    Run,
+    Skip,
+    Quit,
+}
+
+/// Interactive pause before a step: show it, and let the user inspect, drop into
+/// a shell with the step's exact environment, then continue / skip / quit.
+#[allow(clippy::too_many_arguments)]
+fn pause_before(
+    number: usize,
+    label: &str,
+    shell: &str,
+    script: &str,
+    cwd: &Path,
+    step_env: &IndexMap<String, String>,
+    path: &[String],
+    github: &Value,
+    runner: &Value,
+) -> Result<Decision> {
+    println!("  ⏸  paused before step {number}: {label}");
+    println!("     shell: {shell}   cwd: {}", cwd.display());
+    loop {
+        print!("     [c]ontinue  [s]hell  [i]nfo  s[k]ip  [q]uit > ");
+        std::io::stdout().flush().ok();
+
+        let mut line = String::new();
+        let n = std::io::stdin().lock().read_line(&mut line)?;
+        if n == 0 {
+            // EOF (Ctrl-D): treat as quit, since we can't prompt any further.
+            println!();
+            return Ok(Decision::Quit);
+        }
+        let cmd = line.trim().to_ascii_lowercase();
+        match cmd.as_str() {
+            "" | "c" | "continue" => return Ok(Decision::Run),
+            "k" | "skip" => return Ok(Decision::Skip),
+            "q" | "quit" => return Ok(Decision::Quit),
+            "i" | "info" => print_step_info(script, step_env),
+            // A shell that fails to launch must not tear down the run — report
+            // and re-prompt, so the debugger stays alive.
+            "s" | "shell" => {
+                if let Err(e) = drop_into_shell(cwd, step_env, path, github, runner) {
+                    println!("     shell error: {e:#}");
+                }
+            }
+            other => println!("     unknown command `{other}` (c/s/i/k/q)"),
+        }
+    }
+}
+
+/// Print the resolved script and the step's environment overrides.
+fn print_step_info(script: &str, step_env: &IndexMap<String, String>) {
+    println!("     ── script ──");
+    for l in script.lines() {
+        println!("     {l}");
+    }
+    if !step_env.is_empty() {
+        println!("     ── env ──");
+        for (k, v) in step_env {
+            println!("     {k}={}", clip(v));
+        }
+    }
+}
+
+/// Drop into an interactive `$SHELL` with the step's environment and cwd.
+fn drop_into_shell(
+    cwd: &Path,
+    step_env: &IndexMap<String, String>,
+    path: &[String],
+    github: &Value,
+    runner: &Value,
+) -> Result<()> {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "bash".to_string());
+    println!("     ↪ {shell} — the step's env & cwd; type `exit` to return to stepci");
+    println!("       (note: $GITHUB_ENV/$GITHUB_OUTPUT writes here do not round-trip)\n");
+    let mut cmd = Command::new(&shell);
+    cmd.current_dir(cwd);
+    apply_common_env(&mut cmd, step_env, path, github, runner, cwd);
+    cmd.status()
+        .map_err(|e| anyhow::anyhow!("failed to launch shell `{shell}`: {e}"))?;
+    println!();
     Ok(())
 }
 
@@ -405,14 +591,32 @@ fn spawn_step(
     let mut cmd = Command::new(&program);
     cmd.args(&args).current_dir(cwd);
 
-    // User-defined env for the step.
-    cmd.envs(step_env);
+    apply_common_env(&mut cmd, step_env, path_additions, github, runner, cwd);
 
-    // Reserved runner variables (set last so a workflow can't clobber our channels).
+    // Reserved channel files (set after common env so a workflow can't clobber them).
     cmd.env("GITHUB_ENV", env_file.path());
     cmd.env("GITHUB_OUTPUT", out_file.path());
     cmd.env("GITHUB_PATH", path_file.path());
     cmd.env("GITHUB_STEP_SUMMARY", summary_file.path());
+
+    let status = cmd
+        .status()
+        .map_err(|e| anyhow::anyhow!("failed to launch shell `{program}` for the step: {e}"))?;
+    Ok(status)
+}
+
+/// Apply the step's user env plus the standard runner variables — workspace, CI
+/// markers, `RUNNER_*`, the `GITHUB_*` mirror of the github context, and `PATH`
+/// additions. Shared by the step spawn and the interactive debug shell.
+fn apply_common_env(
+    cmd: &mut Command,
+    step_env: &IndexMap<String, String>,
+    path_additions: &[String],
+    github: &Value,
+    runner: &Value,
+    cwd: &Path,
+) {
+    cmd.envs(step_env);
     cmd.env("GITHUB_WORKSPACE", cwd);
     cmd.env("CI", "true");
     cmd.env("GITHUB_ACTIONS", "true");
@@ -422,7 +626,6 @@ fn spawn_step(
     if let Some(arch) = object_get(runner, "arch") {
         cmd.env("RUNNER_ARCH", arch);
     }
-    // Mirror the github context into the standard GITHUB_* variables steps read.
     for (var, key) in [
         ("GITHUB_SHA", "sha"),
         ("GITHUB_REF", "ref"),
@@ -433,8 +636,6 @@ fn spawn_step(
             cmd.env(var, val);
         }
     }
-
-    // Prepend GITHUB_PATH additions to PATH.
     if !path_additions.is_empty() {
         let existing = std::env::var("PATH").unwrap_or_default();
         let joined = path_additions.join(":");
@@ -445,11 +646,6 @@ fn spawn_step(
         };
         cmd.env("PATH", new_path);
     }
-
-    let status = cmd
-        .status()
-        .map_err(|e| anyhow::anyhow!("failed to launch shell `{program}` for the step: {e}"))?;
-    Ok(status)
 }
 
 /// Map a shell name to a program + argument list, matching the runner's defaults.
@@ -740,6 +936,35 @@ fn step_label(step: &Step) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn opts(step_all: bool, breakpoints: &[&str]) -> RunOptions {
+        RunOptions {
+            job: None,
+            workspace: ".".into(),
+            step_all,
+            breakpoints: breakpoints.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn should_pause_respects_step_all_and_breakpoints() {
+        let wf = crate::parse::parse_str(
+            "jobs:\n  j:\n    runs-on: x\n    steps:\n      - id: build\n        run: 'true'\n      - run: 'true'\n",
+        )
+        .unwrap();
+        let steps = &wf.jobs["j"].steps;
+        let with_id = &steps[0];
+        let no_id = &steps[1];
+
+        // --step pauses everywhere.
+        assert!(should_pause_at(with_id, &opts(true, &[])));
+        assert!(should_pause_at(no_id, &opts(true, &[])));
+        // --break pauses only at the matching id.
+        assert!(should_pause_at(with_id, &opts(false, &["build"])));
+        assert!(!should_pause_at(no_id, &opts(false, &["build"])));
+        // Neither flag → never pause.
+        assert!(!should_pause_at(with_id, &opts(false, &[])));
+    }
 
     fn ctx(status: JobStatus) -> Context {
         let mut vars = IndexMap::new();

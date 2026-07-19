@@ -3,12 +3,11 @@
 [![CI](https://github.com/adityasinha-ghub/stepci/actions/workflows/ci.yml/badge.svg)](https://github.com/adityasinha-ghub/stepci/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-> ⚠️ **Status: early — works, but incomplete.** `stepci run` now *executes* a
-> workflow's `run:` steps natively — evaluating `if:` conditions, interpolating
-> `${{ }}`, and propagating `$GITHUB_ENV`/`$GITHUB_OUTPUT` between steps. The
-> per-step **diff**, the interactive **debugger** (pause/shell), and **secret
-> managers** are not built yet. This README is honest about that. See
-> [Roadmap](#roadmap).
+> ⚠️ **Status: early — works, but incomplete.** `stepci run` executes a workflow's
+> `run:` steps natively (evaluating `if:`, interpolating `${{ }}`, propagating
+> `$GITHUB_ENV`/`$GITHUB_OUTPUT`), shows a **per-step diff** of what changed, and
+> can **pause** for an interactive shell. Not built yet: `uses:` actions and
+> **secret managers**. This README is honest about that. See [Roadmap](#roadmap).
 
 **A native, Dockerless debugger for GitHub Actions — step through a workflow run
 on your own machine, see exactly what each step changed, using your real secrets.**
@@ -17,7 +16,7 @@ You edit a workflow, push, wait for CI, read the log, guess, and push again.
 Twelve "fix CI" commits later it goes green. `stepci` collapses that loop: run
 the workflow locally, pause between steps, and inspect *what actually happened*.
 
-**Today** — it runs the workflow natively and reports each step:
+**Run it** — natively, reporting each step and what it changed:
 
 ```bash
 stepci run .github/workflows/ci.yml
@@ -25,26 +24,31 @@ stepci run .github/workflows/ci.yml
 
 ```
 ● job build (build)
-  ▸ step 2: Interpolation + workflow env …
-hello from macOS / main
-  ✓ step 2 ok
-  ▸ step 4: Soft failure …
-  ⚠ step 4 failed (exit 3) — continue-on-error
+  ▸ step 3: Create build outputs …
+  ✓ step 3 ok
+    files:
+      + build/ (3 files)      ← a wholly-new directory, collapsed to one line
+  ▸ step 4: Modify a file and extend PATH …
+  ✓ step 4 ok
+    env:
+      + PATH ⊕ /opt/custom/bin
+    files:
+      ~ toplevel.txt
 ```
 
-**Where it's going** — pause between steps and show exactly what each one changed:
+**Step through it** — pause before each step (`--step`) or at specific ids
+(`--break <id>`), drop into a shell with the step's exact env and cwd, then continue:
 
 ```
-● job: test  (native)
-  ▸ step 2/6  "Install deps"   run: npm ci
-    ⏸ paused — [c]ontinue  [s]hell  [d]iff  [q]uit
+stepci run .github/workflows/ci.yml --step
+```
 
-    env changed:
-      + NODE_ENV = production
-      ~ PATH     = …/node_modules/.bin:$PATH   (prepended)
-    files changed:
-      + node_modules/            (14,203 files)
-      ~ package-lock.json         (1 line)
+```
+● job build (build)
+  ▸ step 2: Build …
+  ⏸  paused before step 2: Build
+     shell: bash   cwd: /repo
+     [c]ontinue  [s]hell  [i]nfo  s[k]ip  [q]uit >
 ```
 
 ## Why not just use `act`?
@@ -153,7 +157,7 @@ the common functions. Deferred or approximate:
 - [x] Native step executor (`run:` steps: shell, env/output/path propagation, `if:`, `continue-on-error`, job order)
 - [x] Per-step environment **diff** (exported vars + `PATH` additions)
 - [x] Per-step filesystem **diff** (added/removed/modified, new dirs collapsed)
-- [ ] Interactive debugger loop (pause / shell / continue / quit)
+- [x] Interactive debugger loop (`--step`/`--break`: pause / shell / info / skip / quit)
 - [ ] Secrets: env + 1Password / Vault
 - [ ] Session recording → replayable script
 - [ ] *(stretch)* Docker/JS `uses:` actions; macOS; matrix

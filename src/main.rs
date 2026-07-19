@@ -34,13 +34,13 @@ struct RunArgs {
     #[arg(long)]
     job: Option<String>,
 
-    /// Pause before these step ids (repeatable). Reserved for the debugger loop.
+    /// Pause before every step (interactive step-through).
+    #[arg(long, short = 's')]
+    step: bool,
+
+    /// Pause before steps with these ids (repeatable).
     #[arg(long = "break", value_name = "STEP_ID")]
     breakpoints: Vec<String>,
-
-    /// Run to completion without pausing. Reserved for the debugger loop.
-    #[arg(long)]
-    no_pause: bool,
 }
 
 fn main() {
@@ -61,15 +61,11 @@ fn try_main() -> Result<()> {
 fn run(args: RunArgs) -> Result<()> {
     let workflow = parse::parse_file(&args.workflow)?;
 
-    if !args.breakpoints.is_empty() || args.no_pause {
-        eprintln!(
-            "note: --break/--no-pause apply once the interactive debugger lands; v0 runs straight through."
-        );
-    }
-
     let opts = RunOptions {
         job: args.job,
         workspace: std::env::current_dir().context("getting the current directory")?,
+        step_all: args.step,
+        breakpoints: args.breakpoints,
     };
     let code = exec::run_workflow(&workflow, &opts)?;
     std::process::exit(code);

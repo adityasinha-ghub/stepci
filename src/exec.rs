@@ -425,17 +425,31 @@ enum ResolvedAction {
     Composite(Box<ActionDef>, PathBuf),
     /// A JavaScript action: its definition and directory.
     Node(Box<ActionDef>, PathBuf),
+    /// A Docker action: its definition and directory (build context).
+    Docker(Box<ActionDef>, PathBuf),
     /// Recognized but not runnable yet — carries a reason to show the user.
     Unsupported(String),
 }
 
-/// Resolve a `uses:` reference to a local action directory. Local `./…` and
-/// remote `owner/repo@ref` actions are resolved (remote ones fetched + cached);
-/// JavaScript and Docker actions are recognized and reported (coming later).
+/// Resolve a `uses:` reference to a runnable action. Local `./…` and remote
+/// `owner/repo@ref` composite/JS/Docker actions run; a bare `docker://image`
+/// runs that image directly.
 fn resolve_action(reference: &str, workspace: &Path) -> Result<ResolvedAction> {
-    if reference.starts_with("docker://") {
-        return Ok(ResolvedAction::Unsupported(
-            "Docker actions aren't supported yet".to_string(),
+    if let Some(image) = reference.strip_prefix("docker://") {
+        // A direct image reference: a Docker action with no metadata.
+        let def = ActionDef {
+            inputs: IndexMap::new(),
+            outputs: IndexMap::new(),
+            runs: Runs::Docker {
+                image: image.to_string(),
+                entrypoint: None,
+                args: Vec::new(),
+                env: IndexMap::new(),
+            },
+        };
+        return Ok(ResolvedAction::Docker(
+            Box::new(def),
+            workspace.to_path_buf(),
         ));
     }
 
@@ -460,9 +474,7 @@ fn resolve_action(reference: &str, workspace: &Path) -> Result<ResolvedAction> {
     match &def.runs {
         Runs::Composite { .. } => Ok(ResolvedAction::Composite(Box::new(def), dir)),
         Runs::Node { .. } => Ok(ResolvedAction::Node(Box::new(def), dir)),
-        Runs::Docker { .. } => Ok(ResolvedAction::Unsupported(
-            "Docker action — support arrives in a later milestone".to_string(),
-        )),
+        Runs::Docker { .. } => Ok(ResolvedAction::Docker(Box::new(def), dir)),
     }
 }
 
@@ -481,10 +493,17 @@ fn run_uses_step(
 ) -> Result<Flow> {
     println!(); // end the "… " header line
 
+    #[derive(Clone, Copy)]
+    enum Kind {
+        Composite,
+        Node,
+        Docker,
+    }
     let resolved = resolve_action(reference, &opts.workspace)?;
-    let (def, dir, is_node) = match resolved {
-        ResolvedAction::Composite(def, dir) => (def, dir, false),
-        ResolvedAction::Node(def, dir) => (def, dir, true),
+    let (def, dir, kind) = match resolved {
+        ResolvedAction::Composite(def, dir) => (def, dir, Kind::Composite),
+        ResolvedAction::Node(def, dir) => (def, dir, Kind::Node),
+        ResolvedAction::Docker(def, dir) => (def, dir, Kind::Docker),
         ResolvedAction::Unsupported(reason) => {
             println!("  ⤼ step {number} skipped ({reason})");
             record_step(state, step, "skipped", "skipped", IndexMap::new());
@@ -499,15 +518,21 @@ fn run_uses_step(
     let path_before = state.path.clone();
     let fs_before = diff::snapshot_fs(&opts.workspace, MAX_DIFF_FILES);
 
-    let kind = if is_node { "javascript" } else { "composite" };
-    println!("  ┌ {kind} action `{reference}`");
-    let (outputs, ok) = if is_node {
-        let Runs::Node { main, .. } = &def.runs else {
-            unreachable!("resolved as Node")
-        };
-        run_node_action(main, &dir, &inputs, state, github, runner, opts)?
-    } else {
-        run_composite(&def, &inputs, state, github, runner, opts, &dir)?
+    let kind_label = match kind {
+        Kind::Composite => "composite",
+        Kind::Node => "javascript",
+        Kind::Docker => "docker",
+    };
+    println!("  ┌ {kind_label} action `{reference}`");
+    let (outputs, ok) = match kind {
+        Kind::Composite => run_composite(&def, &inputs, state, github, runner, opts, &dir)?,
+        Kind::Node => {
+            let Runs::Node { main, .. } = &def.runs else {
+                unreachable!("resolved as Node")
+            };
+            run_node_action(main, &dir, &inputs, state, github, runner, opts)?
+        }
+        Kind::Docker => run_docker_action(&def, &dir, &inputs, state, github, runner, opts)?,
     };
     println!("  └ end `{reference}`");
 
@@ -594,6 +619,160 @@ fn run_node_action(
     }
     let outputs: IndexMap<String, String> = read_key_values(out_file.path())?.into_iter().collect();
     Ok((outputs, status.success()))
+}
+
+/// Run a Docker action: build (if a `Dockerfile`) or use a prebuilt image, then
+/// `docker run` it with the workspace mounted at `/github/workspace`, `INPUT_*`
+/// env, and the channel files mounted so its `$GITHUB_*` writes come back.
+///
+/// This is the one place we shell out to Docker (the "Docker only when required"
+/// stance). Containers run as root, so files they create in the workspace are
+/// root-owned on the host.
+fn run_docker_action(
+    def: &ActionDef,
+    action_dir: &Path,
+    inputs: &IndexMap<String, String>,
+    state: &mut JobState,
+    github: &Value,
+    runner: &Value,
+    opts: &RunOptions,
+) -> Result<(IndexMap<String, String>, bool)> {
+    let Runs::Docker {
+        image,
+        entrypoint,
+        args,
+        env: docker_env,
+    } = &def.runs
+    else {
+        return Ok((IndexMap::new(), true));
+    };
+
+    // Resolve the image: build a `Dockerfile`, else use it as a prebuilt name.
+    let image_name = if let Some(img) = image.strip_prefix("docker://") {
+        img.to_string()
+    } else if image == "Dockerfile" || image.ends_with("/Dockerfile") {
+        let dockerfile = action_dir.join(image);
+        let tag = docker_tag(action_dir);
+        println!("  │ building image from {}", dockerfile.display());
+        let built = docker_run(&[
+            "build".into(),
+            "-q".into(),
+            "-t".into(),
+            tag.clone(),
+            "-f".into(),
+            path_str(&dockerfile)?,
+            path_str(action_dir)?,
+        ])?;
+        if !built.success() {
+            bail!("docker build failed for `{}`", dockerfile.display());
+        }
+        tag
+    } else {
+        image.clone()
+    };
+
+    // A host dir for the file-command channels, mounted into the container.
+    let chan = tempfile::tempdir().context("creating docker channel dir")?;
+    for f in ["env", "output", "path", "state", "summary"] {
+        std::fs::File::create(chan.path().join(f)).context("creating docker channel file")?;
+    }
+    let ws = std::fs::canonicalize(&opts.workspace).unwrap_or_else(|_| opts.workspace.clone());
+
+    let mut run: Vec<String> = vec![
+        "run".into(),
+        "--rm".into(),
+        "-w".into(),
+        "/github/workspace".into(),
+        "-v".into(),
+        format!("{}:/github/workspace", path_str(&ws)?),
+        "-v".into(),
+        format!("{}:/github/file_commands", path_str(chan.path())?),
+    ];
+
+    // Env: INPUT_*, the action's own env, and the reserved runner variables.
+    let ictx = make_context_with_inputs(
+        &state.env,
+        github,
+        runner,
+        &IndexMap::new(),
+        &opts.secrets,
+        inputs,
+        JobStatus::Success,
+    );
+    let mut env = input_env_vars(inputs);
+    for (k, v) in docker_env {
+        env.insert(k.clone(), expr::interpolate(v, &ictx)?);
+    }
+    env.insert("GITHUB_WORKSPACE".into(), "/github/workspace".into());
+    env.insert("CI".into(), "true".into());
+    env.insert("GITHUB_ACTIONS".into(), "true".into());
+    env.insert("RUNNER_OS".into(), "Linux".into());
+    for f in ["env", "output", "path", "state", "summary"] {
+        env.insert(
+            format!("GITHUB_{}", f.to_ascii_uppercase()),
+            format!("/github/file_commands/{f}"),
+        );
+    }
+    for (var, key) in [
+        ("GITHUB_SHA", "sha"),
+        ("GITHUB_REF", "ref"),
+        ("GITHUB_REF_NAME", "ref_name"),
+        ("GITHUB_EVENT_NAME", "event_name"),
+    ] {
+        if let Some(val) = object_get(github, key) {
+            env.insert(var.to_string(), val);
+        }
+    }
+    for (k, v) in &env {
+        run.push("-e".into());
+        run.push(format!("{k}={v}"));
+    }
+
+    if let Some(ep) = entrypoint {
+        run.push("--entrypoint".into());
+        run.push(ep.clone());
+    }
+    run.push(image_name);
+    for a in args {
+        run.push(expr::interpolate(a, &ictx)?);
+    }
+
+    let status = docker_run(&run)?;
+
+    // Read the mounted channel files back.
+    let read = |name: &str| std::fs::read_to_string(chan.path().join(name)).unwrap_or_default();
+    for (k, v) in envfile::parse_key_values(&read("env"))? {
+        state.env.insert(k, v);
+    }
+    for p in envfile::parse_path_additions(&read("path")) {
+        state.path.insert(0, p);
+    }
+    let outputs: IndexMap<String, String> = envfile::parse_key_values(&read("output"))?
+        .into_iter()
+        .collect();
+    Ok((outputs, status.success()))
+}
+
+/// Run `docker` with the given args (stdio inherited), returning its exit status.
+fn docker_run(args: &[String]) -> Result<std::process::ExitStatus> {
+    Command::new("docker")
+        .args(args)
+        .status()
+        .map_err(|e| anyhow::anyhow!("failed to run docker (is it installed and running?): {e}"))
+}
+
+/// A stable image tag for a built action, derived from its directory.
+fn docker_tag(dir: &Path) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    dir.hash(&mut h);
+    format!("stepci-action:{:x}", h.finish())
+}
+
+fn path_str(p: &Path) -> Result<String> {
+    p.to_str()
+        .map(String::from)
+        .ok_or_else(|| anyhow::anyhow!("path is not valid UTF-8: `{}`", p.display()))
 }
 
 /// Compute the inputs a composite action sees: each declared input takes its
@@ -1584,9 +1763,10 @@ mod tests {
         // These paths never touch the network (remote refs are covered by
         // fetch::parse_remote's unit tests).
         let ws = Path::new("/nonexistent-workspace-xyz");
+        // A bare image is a Docker action.
         assert!(matches!(
             resolve_action("docker://alpine", ws).unwrap(),
-            ResolvedAction::Unsupported(_)
+            ResolvedAction::Docker(_, _)
         ));
         assert!(matches!(
             resolve_action("not-a-valid-ref", ws).unwrap(),

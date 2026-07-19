@@ -149,9 +149,15 @@ pub enum Runs {
         pre: Option<String>,
         post: Option<String>,
     },
-    /// A Docker action. Executed in a later milestone.
+    /// A Docker action.
     Docker {
-        /// The image reference (`docker://…`) or `Dockerfile`.
+        /// The image reference: `docker://…` (prebuilt) or `Dockerfile` (built).
         image: String,
+        /// An entrypoint override (`runs.entrypoint`).
+        entrypoint: Option<String>,
+        /// Command args (`runs.args`), each a `${{ }}`-interpolatable string.
+        args: Vec<String>,
+        /// Extra container env (`runs.env`).
+        env: IndexMap<String, String>,
     },
 }

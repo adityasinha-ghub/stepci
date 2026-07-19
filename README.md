@@ -130,14 +130,17 @@ the common functions. Deferred or approximate:
 ### Known executor gaps (v0)
 
 - **`uses:` actions:** local **and remote** (`owner/repo@ref`, git-fetched into
-  `~/.cache/stepci`) **composite** and **JavaScript** actions run natively
-  (inputs, defaults, `INPUT_*`, outputs, `$GITHUB_ENV` propagation). **Docker**
-  actions are reported and skipped for now.
+  `~/.cache/stepci`) **composite**, **JavaScript**, and **Docker** actions run
+  (inputs, defaults, `INPUT_*`, outputs, `$GITHUB_ENV` propagation).
   - JS actions use the **host `node`** (version isn't pinned to `node16`/`node20`);
     `pre`/`post` hooks and stdout `::workflow-commands::` (e.g. legacy
     `::set-output::`) aren't handled yet — actions using the file-based
     `$GITHUB_OUTPUT`/`$GITHUB_ENV` work. Actions needing a real token/full event
     payload (e.g. `checkout` on a private repo) may not fully succeed.
+  - **Docker** actions are the *only* place Docker is used: `docker://image` and
+    `Dockerfile` builds, workspace mounted at `/github/workspace`, with channel
+    writeback. Containers run as root (host files they create are root-owned);
+    `services:`/`container:` jobs aren't supported yet.
   - Nested `uses:` inside a composite is skipped, and a composite `run:` step
     without `shell:` defaults to bash (GitHub requires it).
 - **Native execution inherits your host environment** and runs on your host OS
@@ -192,9 +195,11 @@ is the secret.
 - [x] Local **composite** `uses:` actions (inputs/defaults/`INPUT_*`/outputs, `$GITHUB_ENV` propagation)
 - [x] Remote action fetching (`owner/repo@ref`, git-cached) — remote composite actions run
 - [x] JavaScript actions (host Node runtime, `INPUT_*`/outputs/`GITHUB_ACTION_PATH`)
-- [ ] Docker actions & service containers (Docker only when required)
-- [ ] `matrix` strategy; artifacts & `actions/cache`
-- [ ] Session recording → replayable script
+- [x] Docker actions (`docker://` + `Dockerfile` build, workspace mount, channel writeback) — *the one place Docker is used*
+- [ ] `matrix` strategy
+- [ ] Artifacts & `actions/cache`; service containers
+- [ ] Fidelity/hardening (JS `pre`/`post`, stdout `::commands::`, `hashFiles`, real-workflow testing)
+- [ ] Session recording → replayable script; **publish**
 
 ## Install
 

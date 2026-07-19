@@ -334,6 +334,11 @@ struct RawRuns {
     pre: Option<String>,
     post: Option<String>,
     image: Option<String>,
+    entrypoint: Option<String>,
+    #[serde(default)]
+    args: Vec<Yaml>,
+    #[serde(default)]
+    env: IndexMap<String, Yaml>,
 }
 
 impl RawAction {
@@ -392,7 +397,18 @@ impl RawRuns {
             let image = self
                 .image
                 .ok_or_else(|| anyhow!("`runs.image` is required for a docker action"))?;
-            Ok(Runs::Docker { image })
+            let args = self
+                .args
+                .iter()
+                .map(scalar_to_string)
+                .collect::<Result<Vec<_>>>()
+                .context("`runs.args`")?;
+            Ok(Runs::Docker {
+                image,
+                entrypoint: self.entrypoint,
+                args,
+                env: scalar_map(self.env, "`runs.env`")?,
+            })
         } else {
             bail!("unsupported action runtime `runs.using: {}`", self.using)
         }

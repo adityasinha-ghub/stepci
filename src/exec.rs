@@ -19,6 +19,7 @@ use tempfile::NamedTempFile;
 use crate::diff::{self, Entry, EnvDiff, FsDiff};
 use crate::envfile;
 use crate::expr::{self, Context, JobStatus};
+use crate::fetch;
 use crate::model::{ActionDef, Conditional, Job, Runs, Step, StepAction, Workflow};
 use crate::parse;
 use crate::value::Value;
@@ -426,22 +427,27 @@ enum ResolvedAction {
     Unsupported(String),
 }
 
-/// Resolve a `uses:` reference. Local `./…` composite actions run now; remote,
-/// JavaScript, and Docker actions are recognized and reported (coming later).
+/// Resolve a `uses:` reference to a local action directory. Local `./…` and
+/// remote `owner/repo@ref` actions are resolved (remote ones fetched + cached);
+/// JavaScript and Docker actions are recognized and reported (coming later).
 fn resolve_action(reference: &str, workspace: &Path) -> Result<ResolvedAction> {
     if reference.starts_with("docker://") {
         return Ok(ResolvedAction::Unsupported(
             "Docker actions aren't supported yet".to_string(),
         ));
     }
-    // Only `./` and `../` are local; everything else is a remote `owner/repo@ref`.
-    if !(reference.starts_with("./") || reference.starts_with("../")) {
-        return Ok(ResolvedAction::Unsupported(format!(
-            "remote action `{reference}` — fetching arrives in a later milestone"
-        )));
-    }
 
-    let dir = workspace.join(reference);
+    let dir = if reference.starts_with("./") || reference.starts_with("../") {
+        workspace.join(reference)
+    } else if let Some(remote) = fetch::parse_remote(reference) {
+        println!("  ⟳ fetching {reference}");
+        fetch::fetch(&remote, &fetch::cache_root()?)?
+    } else {
+        return Ok(ResolvedAction::Unsupported(format!(
+            "unrecognized `uses:` reference `{reference}`"
+        )));
+    };
+
     let action_file = ["action.yml", "action.yaml"]
         .iter()
         .map(|f| dir.join(f))
@@ -1506,13 +1512,15 @@ mod tests {
 
     #[test]
     fn resolve_action_classifies_references() {
+        // These paths never touch the network (remote refs are covered by
+        // fetch::parse_remote's unit tests).
         let ws = Path::new("/nonexistent-workspace-xyz");
         assert!(matches!(
-            resolve_action("actions/checkout@v4", ws).unwrap(),
+            resolve_action("docker://alpine", ws).unwrap(),
             ResolvedAction::Unsupported(_)
         ));
         assert!(matches!(
-            resolve_action("docker://alpine", ws).unwrap(),
+            resolve_action("not-a-valid-ref", ws).unwrap(),
             ResolvedAction::Unsupported(_)
         ));
         // Local but missing action.yml → a clean error, not a panic.

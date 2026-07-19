@@ -129,11 +129,12 @@ the common functions. Deferred or approximate:
 
 ### Known executor gaps (v0)
 
-- **`uses:` actions:** local **composite** actions (`./…`) run natively (inputs,
-  defaults, `INPUT_*`, outputs, `$GITHUB_ENV` propagation). **Remote** actions
-  (`owner/repo@ref`), **JavaScript**, and **Docker** actions are reported and
-  skipped for now. Nested `uses:` inside a composite is also skipped, and a
-  composite `run:` step without `shell:` defaults to bash (GitHub requires it).
+- **`uses:` actions:** local **and remote** (`owner/repo@ref`, git-fetched into
+  `~/.cache/stepci`) **composite** actions run natively (inputs, defaults,
+  `INPUT_*`, outputs, `$GITHUB_ENV` propagation). **JavaScript** and **Docker**
+  actions are reported and skipped for now. Nested `uses:` inside a composite is
+  also skipped, and a composite `run:` step without `shell:` defaults to bash
+  (GitHub requires it).
 - **Native execution inherits your host environment** and runs on your host OS
   (`runs-on` is informational). Convenient, but not a hermetic Ubuntu runner.
 - **`matrix`, service containers, and artifacts** are not supported yet.
@@ -184,7 +185,8 @@ is the secret.
 - [x] Interactive debugger loop (`--step`/`--break`: pause / shell / info / skip / quit)
 - [x] Secrets: `--secret`/`--secret-file`, with `op://` (1Password) & `vault://` resolution + output masking
 - [x] Local **composite** `uses:` actions (inputs/defaults/`INPUT_*`/outputs, `$GITHUB_ENV` propagation)
-- [ ] Remote action fetching (`owner/repo@ref`) + JavaScript actions
+- [x] Remote action fetching (`owner/repo@ref`, git-cached) — remote composite actions run
+- [ ] JavaScript actions (Node runtime) — makes `checkout`/`setup-*` run
 - [ ] Docker actions & service containers (Docker only when required)
 - [ ] `matrix` strategy; artifacts & `actions/cache`
 - [ ] Session recording → replayable script

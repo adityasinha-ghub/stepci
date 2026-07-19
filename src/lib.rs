@@ -12,6 +12,7 @@ pub mod diff;
 pub mod envfile;
 pub mod exec;
 pub mod expr;
+pub mod fetch;
 pub mod model;
 pub mod parse;
 pub mod secrets;

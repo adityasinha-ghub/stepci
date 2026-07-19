@@ -5,13 +5,16 @@
 //! the fiddly normalization — scalar-to-string coercion, string-or-list fields,
 //! the `run`/`uses` split — in one place with contextual error messages.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use indexmap::IndexMap;
 use serde::Deserialize;
 use serde_yaml::Value as Yaml;
 use std::path::Path;
 
-use crate::model::{Conditional, Defaults, Job, Step, StepAction, Workflow};
+use crate::model::{
+    ActionDef, ActionInput, ActionOutput, Conditional, Defaults, Job, Runs, Step, StepAction,
+    Workflow,
+};
 
 /// Read and parse a workflow file from disk.
 pub fn parse_file(path: &Path) -> Result<Workflow> {
@@ -278,6 +281,121 @@ fn kind_of(v: &Yaml) -> &'static str {
         Yaml::Sequence(_) => "sequence",
         Yaml::Mapping(_) => "mapping",
         Yaml::Tagged(_) => "tagged value",
+    }
+}
+
+// ---------------------------------------------------------------------------
+// action.yml parsing (reuses the workflow RawStep machinery)
+// ---------------------------------------------------------------------------
+
+/// Read and parse an action's `action.yml` / `action.yaml`.
+pub fn parse_action_file(path: &Path) -> Result<ActionDef> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("reading action `{}`", path.display()))?;
+    parse_action_str(&text).with_context(|| format!("in action `{}`", path.display()))
+}
+
+/// Parse an action definition from a string.
+pub fn parse_action_str(text: &str) -> Result<ActionDef> {
+    if text.trim().is_empty() {
+        bail!("action file is empty");
+    }
+    let raw: RawAction = serde_yaml::from_str(text).context("invalid action YAML")?;
+    raw.into_action()
+}
+
+#[derive(Deserialize)]
+struct RawAction {
+    #[serde(default)]
+    inputs: IndexMap<String, RawActionInput>,
+    #[serde(default)]
+    outputs: IndexMap<String, RawActionOutput>,
+    runs: RawRuns,
+}
+
+#[derive(Deserialize)]
+struct RawActionInput {
+    default: Option<Yaml>,
+    #[serde(default)]
+    required: bool,
+}
+
+#[derive(Deserialize)]
+struct RawActionOutput {
+    value: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RawRuns {
+    using: String,
+    #[serde(default)]
+    steps: Vec<RawStep>,
+    main: Option<String>,
+    pre: Option<String>,
+    post: Option<String>,
+    image: Option<String>,
+}
+
+impl RawAction {
+    fn into_action(self) -> Result<ActionDef> {
+        let mut inputs = IndexMap::with_capacity(self.inputs.len());
+        for (name, raw) in self.inputs {
+            let default = raw
+                .default
+                .as_ref()
+                .map(scalar_to_string)
+                .transpose()
+                .with_context(|| format!("input `{name}` default"))?;
+            inputs.insert(
+                name,
+                ActionInput {
+                    default,
+                    required: raw.required,
+                },
+            );
+        }
+        let outputs = self
+            .outputs
+            .into_iter()
+            .map(|(name, raw)| (name, ActionOutput { value: raw.value }))
+            .collect();
+        Ok(ActionDef {
+            inputs,
+            outputs,
+            runs: self.runs.into_runs()?,
+        })
+    }
+}
+
+impl RawRuns {
+    fn into_runs(self) -> Result<Runs> {
+        let using = self.using.to_ascii_lowercase();
+        if using == "composite" {
+            let mut steps = Vec::with_capacity(self.steps.len());
+            for (i, raw) in self.steps.into_iter().enumerate() {
+                let step = raw
+                    .into_step()
+                    .with_context(|| format!("in composite step {}", i + 1))?;
+                steps.push(step);
+            }
+            Ok(Runs::Composite { steps })
+        } else if using.starts_with("node") {
+            let main = self
+                .main
+                .ok_or_else(|| anyhow!("`runs.main` is required for a `{}` action", self.using))?;
+            Ok(Runs::Node {
+                main,
+                pre: self.pre,
+                post: self.post,
+            })
+        } else if using == "docker" {
+            let image = self
+                .image
+                .ok_or_else(|| anyhow!("`runs.image` is required for a docker action"))?;
+            Ok(Runs::Docker { image })
+        } else {
+            bail!("unsupported action runtime `runs.using: {}`", self.using)
+        }
     }
 }
 
@@ -573,5 +691,56 @@ jobs:
             .find(|s| s.name.as_deref() == Some("Clippy"))
             .expect("a Clippy step");
         assert!(matches!(clippy.action, StepAction::Run { .. }));
+    }
+
+    #[test]
+    fn parses_a_composite_action() {
+        let action = parse_action_str(
+            r#"
+name: Greet
+inputs:
+  who:
+    default: world
+    required: false
+  loud:
+    required: true
+outputs:
+  message:
+    value: ${{ steps.g.outputs.msg }}
+runs:
+  using: composite
+  steps:
+    - id: g
+      shell: bash
+      run: echo "msg=hi ${{ inputs.who }}" >> "$GITHUB_OUTPUT"
+"#,
+        )
+        .unwrap();
+        assert_eq!(action.inputs["who"].default.as_deref(), Some("world"));
+        assert!(action.inputs["loud"].required);
+        assert!(action.inputs["loud"].default.is_none());
+        assert_eq!(
+            action.outputs["message"].value.as_deref(),
+            Some("${{ steps.g.outputs.msg }}")
+        );
+        match &action.runs {
+            Runs::Composite { steps } => {
+                assert_eq!(steps.len(), 1);
+                assert_eq!(steps[0].id.as_deref(), Some("g"));
+            }
+            other => panic!("expected composite, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_a_node_action_and_rejects_unknown_runtime() {
+        let node = parse_action_str("runs:\n  using: node20\n  main: dist/index.js\n").unwrap();
+        assert!(matches!(node.runs, Runs::Node { .. }));
+
+        let err = parse_action_str("runs:\n  using: rust\n").unwrap_err();
+        assert!(format!("{err:#}").contains("unsupported action runtime"));
+
+        // A node action without `main` is an error.
+        assert!(parse_action_str("runs:\n  using: node20\n").is_err());
     }
 }

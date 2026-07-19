@@ -104,3 +104,54 @@ pub enum Conditional {
     /// A raw expression string, evaluated in a later milestone.
     Expr(String),
 }
+
+/// A parsed `action.yml` / `action.yaml` — the metadata for a `uses:` action.
+#[derive(Debug, Clone)]
+pub struct ActionDef {
+    /// Declared inputs, keyed by name (with defaults / required flags).
+    pub inputs: IndexMap<String, ActionInput>,
+    /// Declared outputs, keyed by name.
+    pub outputs: IndexMap<String, ActionOutput>,
+    /// How the action runs.
+    pub runs: Runs,
+}
+
+/// A declared action input.
+#[derive(Debug, Clone)]
+pub struct ActionInput {
+    /// Default value (a `${{ }}` expression is allowed), if any.
+    pub default: Option<String>,
+    /// Whether the input is required.
+    pub required: bool,
+}
+
+/// A declared action output.
+#[derive(Debug, Clone)]
+pub struct ActionOutput {
+    /// For a composite action, the `${{ }}` expression producing the value.
+    /// (`node`/`docker` actions set outputs at runtime, so this is `None`.)
+    pub value: Option<String>,
+}
+
+/// How an action runs, from `runs.using`.
+#[derive(Debug, Clone)]
+pub enum Runs {
+    /// A composite action: a list of steps run in-process.
+    Composite {
+        /// The nested steps.
+        steps: Vec<Step>,
+    },
+    /// A JavaScript action (`node16`/`node20`/…). Executed in a later milestone.
+    Node {
+        /// The entry script (`runs.main`).
+        main: String,
+        /// Optional `pre`/`post` scripts.
+        pre: Option<String>,
+        post: Option<String>,
+    },
+    /// A Docker action. Executed in a later milestone.
+    Docker {
+        /// The image reference (`docker://…`) or `Dockerfile`.
+        image: String,
+    },
+}

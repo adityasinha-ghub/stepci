@@ -3,8 +3,9 @@
 //! [`crate::expr`], and propagating `$GITHUB_ENV`/`$GITHUB_PATH`/`$GITHUB_OUTPUT`
 //! between steps like the real runner.
 //!
-//! v0 scope: `run:` steps only. `uses:` steps are reported as skipped (native
-//! action execution is deferred). Output streams straight through to the terminal.
+//! `run:` steps and local **composite** `uses:` actions run natively; remote,
+//! JavaScript, and Docker actions are reported as skipped (they arrive in later
+//! milestones). Output streams straight through to the terminal.
 
 use std::collections::HashSet;
 use std::io::{BufRead, IsTerminal, Write};
@@ -18,7 +19,8 @@ use tempfile::NamedTempFile;
 use crate::diff::{self, Entry, EnvDiff, FsDiff};
 use crate::envfile;
 use crate::expr::{self, Context, JobStatus};
-use crate::model::{Conditional, Job, Step, StepAction, Workflow};
+use crate::model::{ActionDef, Conditional, Job, Runs, Step, StepAction, Workflow};
+use crate::parse;
 use crate::value::Value;
 
 /// Cap on files walked per workspace snapshot, so a huge tree can't hang a step.
@@ -318,10 +320,10 @@ fn run_step(
 
     let script = match &step.action {
         StepAction::Run { script } => expr::interpolate(script, &ctx)?,
-        StepAction::Uses { action, .. } => {
-            println!("skipped (uses: `{action}` — native actions not supported in v0)");
-            record_step(state, step, "skipped", "skipped", IndexMap::new());
-            return Ok(Flow::Continue);
+        StepAction::Uses { action, with } => {
+            return run_uses_step(
+                step, number, state, github, runner, opts, action, with, &ctx,
+            );
         }
     };
 
@@ -360,47 +362,28 @@ fn run_step(
         }
     }
 
-    // Channel files the step writes back through.
-    let env_file = NamedTempFile::new().context("creating GITHUB_ENV file")?;
-    let out_file = NamedTempFile::new().context("creating GITHUB_OUTPUT file")?;
-    let path_file = NamedTempFile::new().context("creating GITHUB_PATH file")?;
-    let summary_file = NamedTempFile::new().context("creating GITHUB_STEP_SUMMARY file")?;
-
     // Snapshot before running, so we can diff what the step changed.
     let env_before = state.env.clone();
     let path_before = state.path.clone();
     let fs_before = diff::snapshot_fs(&opts.workspace, MAX_DIFF_FILES);
 
-    let status = spawn_step(
-        shell,
-        &script,
-        &cwd,
-        &step_env,
-        &state.path,
-        github,
-        runner,
-        &env_file,
-        &out_file,
-        &path_file,
-        &summary_file,
-    )?;
+    let io = execute_script(shell, &script, &cwd, &step_env, &state.path, github, runner)?;
 
-    // Read back everything the step exported, regardless of exit status.
-    let new_env = read_key_values(env_file.path())?;
-    for (k, v) in &new_env {
+    // Apply everything the step exported, regardless of exit status.
+    for (k, v) in &io.env_additions {
         state.env.insert(k.clone(), v.clone());
     }
-    for p in read_path_additions(path_file.path())? {
+    for p in io.path_additions {
         state.path.insert(0, p); // most recently added wins
     }
-    let outputs = read_key_values(out_file.path())?;
+    let outputs = io.outputs;
 
     // Diff env + filesystem against the pre-run snapshot.
     let fs_after = diff::snapshot_fs(&opts.workspace, MAX_DIFF_FILES);
     let env_delta = diff::env_diff(&env_before, &state.env, &path_before, &state.path);
     let fs_delta = diff::fs_diff(&fs_before, &fs_after);
 
-    let ok = status.success();
+    let ok = io.status.success();
     let (outcome, conclusion) = if ok {
         ("success", "success")
     } else if step_continues_on_error(step, &ctx)? {
@@ -419,7 +402,7 @@ fn run_step(
         outputs.into_iter().collect(),
     );
 
-    let code = status.code().unwrap_or(-1);
+    let code = io.status.code().unwrap_or(-1);
     match (ok, conclusion) {
         (true, _) => println!("  ✓ step {number} ok"),
         (false, "success") => {
@@ -429,6 +412,315 @@ fn run_step(
     }
     print_diff(&env_delta, &fs_delta, &opts.secrets);
     Ok(Flow::Continue)
+}
+
+// ---------------------------------------------------------------------------
+// `uses:` actions (M7: local composite actions run natively)
+// ---------------------------------------------------------------------------
+
+/// What a `uses:` reference resolves to.
+enum ResolvedAction {
+    /// A composite action: its definition and the directory it lives in.
+    Composite(Box<ActionDef>, PathBuf),
+    /// Recognized but not runnable yet — carries a reason to show the user.
+    Unsupported(String),
+}
+
+/// Resolve a `uses:` reference. Local `./…` composite actions run now; remote,
+/// JavaScript, and Docker actions are recognized and reported (coming later).
+fn resolve_action(reference: &str, workspace: &Path) -> Result<ResolvedAction> {
+    if reference.starts_with("docker://") {
+        return Ok(ResolvedAction::Unsupported(
+            "Docker actions aren't supported yet".to_string(),
+        ));
+    }
+    // Only `./` and `../` are local; everything else is a remote `owner/repo@ref`.
+    if !(reference.starts_with("./") || reference.starts_with("../")) {
+        return Ok(ResolvedAction::Unsupported(format!(
+            "remote action `{reference}` — fetching arrives in a later milestone"
+        )));
+    }
+
+    let dir = workspace.join(reference);
+    let action_file = ["action.yml", "action.yaml"]
+        .iter()
+        .map(|f| dir.join(f))
+        .find(|p| p.exists())
+        .ok_or_else(|| anyhow::anyhow!("no action.yml/action.yaml in `{}`", dir.display()))?;
+
+    let def = parse::parse_action_file(&action_file)?;
+    match &def.runs {
+        Runs::Composite { .. } => Ok(ResolvedAction::Composite(Box::new(def), dir)),
+        Runs::Node { .. } => Ok(ResolvedAction::Unsupported(
+            "JavaScript action — the Node runtime arrives in a later milestone".to_string(),
+        )),
+        Runs::Docker { .. } => Ok(ResolvedAction::Unsupported(
+            "Docker action — support arrives in a later milestone".to_string(),
+        )),
+    }
+}
+
+/// Handle a `uses:` step: run it (composite) or report why it was skipped.
+#[allow(clippy::too_many_arguments)]
+fn run_uses_step(
+    step: &Step,
+    number: usize,
+    state: &mut JobState,
+    github: &Value,
+    runner: &Value,
+    opts: &RunOptions,
+    reference: &str,
+    with: &IndexMap<String, String>,
+    ctx: &Context,
+) -> Result<Flow> {
+    println!(); // end the "… " header line
+
+    let resolved = resolve_action(reference, &opts.workspace)?;
+    let (def, dir) = match resolved {
+        ResolvedAction::Composite(def, dir) => (def, dir),
+        ResolvedAction::Unsupported(reason) => {
+            println!("  ⤼ step {number} skipped ({reason})");
+            record_step(state, step, "skipped", "skipped", IndexMap::new());
+            return Ok(Flow::Continue);
+        }
+    };
+
+    // Resolve the inputs the composite sees: `with:` values over declared defaults.
+    let inputs = resolve_inputs(&def, with, ctx)?;
+
+    let env_before = state.env.clone();
+    let path_before = state.path.clone();
+    let fs_before = diff::snapshot_fs(&opts.workspace, MAX_DIFF_FILES);
+
+    println!("  ┌ composite action `{reference}`");
+    let (outputs, ok) = run_composite(&def, &inputs, state, github, runner, opts, &dir)?;
+    println!("  └ end `{reference}`");
+
+    let fs_after = diff::snapshot_fs(&opts.workspace, MAX_DIFF_FILES);
+    let env_delta = diff::env_diff(&env_before, &state.env, &path_before, &state.path);
+    let fs_delta = diff::fs_diff(&fs_before, &fs_after);
+
+    let (outcome, conclusion) = if ok {
+        ("success", "success")
+    } else if step_continues_on_error(step, ctx)? {
+        ("failure", "success")
+    } else {
+        ("failure", "failure")
+    };
+    if conclusion == "failure" {
+        state.status = JobStatus::Failure;
+    }
+    record_step(state, step, outcome, conclusion, outputs);
+
+    match (ok, conclusion) {
+        (true, _) => println!("  ✓ step {number} ok"),
+        (false, "success") => println!("  ⚠ step {number} failed — continue-on-error"),
+        (false, _) => println!("  ✗ step {number} failed"),
+    }
+    print_diff(&env_delta, &fs_delta, &opts.secrets);
+    Ok(Flow::Continue)
+}
+
+/// Compute the inputs a composite action sees: each declared input takes its
+/// `with:` value if present (interpolated), else its default (interpolated).
+fn resolve_inputs(
+    def: &ActionDef,
+    with: &IndexMap<String, String>,
+    ctx: &Context,
+) -> Result<IndexMap<String, String>> {
+    let mut inputs = IndexMap::new();
+    for (name, input) in &def.inputs {
+        let value = if let Some(raw) = with.get(name) {
+            expr::interpolate(raw, ctx)?
+        } else if let Some(default) = &input.default {
+            // A default may reference earlier inputs, so evaluate it against a
+            // context carrying the inputs resolved so far.
+            let mut dctx = ctx.clone();
+            dctx.vars.insert("inputs".to_string(), str_object(&inputs));
+            expr::interpolate(default, &dctx)?
+        } else {
+            if input.required {
+                bail!("action input `{name}` is required but was not provided");
+            }
+            String::new()
+        };
+        inputs.insert(name.clone(), value);
+    }
+    // Also pass through any `with:` keys the action didn't declare (GitHub does).
+    for (name, raw) in with {
+        if !inputs.contains_key(name) {
+            inputs.insert(name.clone(), expr::interpolate(raw, ctx)?);
+        }
+    }
+    Ok(inputs)
+}
+
+/// The `INPUT_<NAME>` environment variables a composite step sees (name
+/// uppercased, spaces → `_`), matching the runner.
+fn input_env_vars(inputs: &IndexMap<String, String>) -> IndexMap<String, String> {
+    inputs
+        .iter()
+        .map(|(k, v)| {
+            (
+                format!("INPUT_{}", k.to_ascii_uppercase().replace(' ', "_")),
+                v.clone(),
+            )
+        })
+        .collect()
+}
+
+/// Run a composite action's steps natively. Returns its outputs and whether it
+/// succeeded. `$GITHUB_ENV`/`$GITHUB_PATH` writes propagate to the job (as on
+/// GitHub); `$GITHUB_OUTPUT` writes are scoped to the composite's own steps.
+fn run_composite(
+    def: &ActionDef,
+    inputs: &IndexMap<String, String>,
+    state: &mut JobState,
+    github: &Value,
+    runner: &Value,
+    opts: &RunOptions,
+    dir: &Path,
+) -> Result<(IndexMap<String, String>, bool)> {
+    let Runs::Composite { steps } = &def.runs else {
+        return Ok((IndexMap::new(), true));
+    };
+    let input_env = input_env_vars(inputs);
+    let mut comp_steps: IndexMap<String, Value> = IndexMap::new();
+    let mut status = JobStatus::Success;
+
+    for (i, cstep) in steps.iter().enumerate() {
+        let ctx = make_context_with_inputs(
+            &state.env,
+            github,
+            runner,
+            &comp_steps,
+            &opts.secrets,
+            inputs,
+            status,
+        );
+
+        let should_run = match &cstep.if_cond {
+            Some(cond) => eval_condition(cond, &ctx)?,
+            None => status == JobStatus::Success,
+        };
+        let label = step_label(cstep);
+        print!("  │ ▹ {}: {label} … ", i + 1);
+        let _ = std::io::stdout().flush();
+
+        if !should_run {
+            println!("skipped (if)");
+            record_composite_step(&mut comp_steps, cstep, "skipped", "skipped", Vec::new());
+            continue;
+        }
+
+        let script = match &cstep.action {
+            StepAction::Run { script } => expr::interpolate(script, &ctx)?,
+            StepAction::Uses { action, .. } => {
+                println!("skipped (nested `uses: {action}` in composite not supported yet)");
+                record_composite_step(&mut comp_steps, cstep, "skipped", "skipped", Vec::new());
+                continue;
+            }
+        };
+
+        // Composite `run:` steps require a shell; default to bash on the host.
+        let shell = cstep.shell.as_deref().unwrap_or("bash");
+        let cwd = resolve_cwd_in(cstep, dir, &opts.workspace);
+
+        let mut step_env = state.env.clone();
+        for (k, v) in &input_env {
+            step_env.insert(k.clone(), v.clone());
+        }
+        for (k, v) in &cstep.env {
+            step_env.insert(k.clone(), expr::interpolate(v, &ctx)?);
+        }
+
+        println!();
+        let io = execute_script(shell, &script, &cwd, &step_env, &state.path, github, runner)?;
+        for (k, v) in &io.env_additions {
+            state.env.insert(k.clone(), v.clone());
+        }
+        for p in io.path_additions {
+            state.path.insert(0, p);
+        }
+
+        let ok = io.status.success();
+        let conclusion = if ok || step_continues_on_error(cstep, &ctx)? {
+            "success"
+        } else {
+            "failure"
+        };
+        if conclusion == "failure" {
+            status = JobStatus::Failure;
+        }
+        record_composite_step(
+            &mut comp_steps,
+            cstep,
+            if ok { "success" } else { "failure" },
+            conclusion,
+            io.outputs,
+        );
+        let code = io.status.code().unwrap_or(-1);
+        match (ok, conclusion) {
+            (true, _) => println!("  │   ✓"),
+            (false, "success") => println!("  │   ⚠ failed (exit {code}) — continue-on-error"),
+            (false, _) => println!("  │   ✗ failed (exit {code})"),
+        }
+    }
+
+    // Evaluate the action's declared outputs against the final composite context.
+    let out_ctx = make_context_with_inputs(
+        &state.env,
+        github,
+        runner,
+        &comp_steps,
+        &opts.secrets,
+        inputs,
+        status,
+    );
+    let mut outputs = IndexMap::new();
+    for (name, out) in &def.outputs {
+        if let Some(expr_str) = &out.value {
+            outputs.insert(name.clone(), expr::interpolate(expr_str, &out_ctx)?);
+        }
+    }
+    Ok((outputs, status == JobStatus::Success))
+}
+
+/// Record a composite step's outcome/outputs into the composite-local `steps`
+/// context (only steps with an `id` are addressable).
+fn record_composite_step(
+    steps: &mut IndexMap<String, Value>,
+    step: &Step,
+    outcome: &str,
+    conclusion: &str,
+    outputs: Vec<(String, String)>,
+) {
+    let Some(id) = &step.id else { return };
+    let outputs_obj: IndexMap<String, Value> = outputs
+        .into_iter()
+        .map(|(k, v)| (k, Value::Str(v)))
+        .collect();
+    let mut obj = IndexMap::new();
+    obj.insert("outputs".to_string(), Value::Object(outputs_obj));
+    obj.insert("outcome".to_string(), Value::Str(outcome.to_string()));
+    obj.insert("conclusion".to_string(), Value::Str(conclusion.to_string()));
+    steps.insert(id.clone(), Value::Object(obj));
+}
+
+/// Resolve a composite step's working directory: its `working-directory` if set
+/// (relative to the workspace), else the workspace.
+fn resolve_cwd_in(step: &Step, _action_dir: &Path, workspace: &Path) -> PathBuf {
+    match step.working_directory.as_deref() {
+        Some(dir) => {
+            let p = Path::new(dir);
+            if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                workspace.join(p)
+            }
+        }
+        None => workspace.to_path_buf(),
+    }
 }
 
 /// Replace any secret value (of a meaningful length) appearing in `s` with `***`,
@@ -662,6 +954,53 @@ fn spawn_step(
     Ok(status)
 }
 
+/// The results of running one shell script: its exit status plus whatever it
+/// wrote back through the `$GITHUB_ENV`/`$GITHUB_PATH`/`$GITHUB_OUTPUT` channels.
+struct StepIo {
+    status: std::process::ExitStatus,
+    env_additions: Vec<(String, String)>,
+    path_additions: Vec<String>,
+    outputs: Vec<(String, String)>,
+}
+
+/// Run a script through the shell with fresh channel files, and read the channels
+/// back. Shared by ordinary `run:` steps and composite-action steps.
+fn execute_script(
+    shell: &str,
+    script: &str,
+    cwd: &Path,
+    step_env: &IndexMap<String, String>,
+    path: &[String],
+    github: &Value,
+    runner: &Value,
+) -> Result<StepIo> {
+    let env_file = NamedTempFile::new().context("creating GITHUB_ENV file")?;
+    let out_file = NamedTempFile::new().context("creating GITHUB_OUTPUT file")?;
+    let path_file = NamedTempFile::new().context("creating GITHUB_PATH file")?;
+    let summary_file = NamedTempFile::new().context("creating GITHUB_STEP_SUMMARY file")?;
+
+    let status = spawn_step(
+        shell,
+        script,
+        cwd,
+        step_env,
+        path,
+        github,
+        runner,
+        &env_file,
+        &out_file,
+        &path_file,
+        &summary_file,
+    )?;
+
+    Ok(StepIo {
+        status,
+        env_additions: read_key_values(env_file.path())?,
+        path_additions: read_path_additions(path_file.path())?,
+        outputs: read_key_values(out_file.path())?,
+    })
+}
+
 /// Apply the step's user env plus the standard runner variables — workspace, CI
 /// markers, `RUNNER_*`, the `GITHUB_*` mirror of the github context, and `PATH`
 /// additions. Shared by the step spawn and the interactive debug shell.
@@ -836,6 +1175,29 @@ fn make_context(
     secrets: &IndexMap<String, String>,
     status: JobStatus,
 ) -> Context {
+    make_context_with_inputs(
+        env,
+        github,
+        runner,
+        steps,
+        secrets,
+        &IndexMap::new(),
+        status,
+    )
+}
+
+/// Like [`make_context`] but also exposes an `inputs` context (for composite
+/// action steps).
+#[allow(clippy::too_many_arguments)]
+fn make_context_with_inputs(
+    env: &IndexMap<String, String>,
+    github: &Value,
+    runner: &Value,
+    steps: &IndexMap<String, Value>,
+    secrets: &IndexMap<String, String>,
+    inputs: &IndexMap<String, String>,
+    status: JobStatus,
+) -> Context {
     let mut job = IndexMap::new();
     job.insert(
         "status".to_string(),
@@ -849,6 +1211,7 @@ fn make_context(
     vars.insert("job".to_string(), Value::Object(job));
     vars.insert("steps".to_string(), Value::Object(steps.clone()));
     vars.insert("secrets".to_string(), str_object(secrets));
+    vars.insert("inputs".to_string(), str_object(inputs));
     Context { vars, status }
 }
 
@@ -1068,6 +1431,92 @@ mod tests {
         github.insert("ref".to_string(), Value::Str("refs/heads/main".to_string()));
         vars.insert("github".to_string(), Value::Object(github));
         Context { vars, status }
+    }
+
+    fn action_input(default: Option<&str>, required: bool) -> crate::model::ActionInput {
+        crate::model::ActionInput {
+            default: default.map(str::to_string),
+            required,
+        }
+    }
+
+    #[test]
+    fn input_env_vars_uppercase_space_and_hyphen() {
+        let mut inputs = IndexMap::new();
+        inputs.insert("my-input".to_string(), "a".to_string());
+        inputs.insert("two words".to_string(), "b".to_string());
+        let env = input_env_vars(&inputs);
+        // Hyphens are preserved (matches the runner); spaces become underscores.
+        assert_eq!(env["INPUT_MY-INPUT"], "a");
+        assert_eq!(env["INPUT_TWO_WORDS"], "b");
+    }
+
+    #[test]
+    fn resolve_inputs_defaults_required_and_passthrough() {
+        let mut inputs = IndexMap::new();
+        inputs.insert("base".to_string(), action_input(Some("hi"), false));
+        // A default that references an earlier input.
+        inputs.insert(
+            "derived".to_string(),
+            action_input(Some("${{ inputs.base }}-x"), false),
+        );
+        let def = ActionDef {
+            inputs,
+            outputs: IndexMap::new(),
+            runs: Runs::Composite { steps: Vec::new() },
+        };
+
+        // No `with`: defaults apply, and `derived` sees `base`.
+        let empty = make_context(
+            &IndexMap::new(),
+            &Value::Null,
+            &Value::Null,
+            &IndexMap::new(),
+            &IndexMap::new(),
+            JobStatus::Success,
+        );
+        let mut with = IndexMap::new();
+        with.insert("extra".to_string(), "passed".to_string()); // undeclared → passthrough
+        let resolved = resolve_inputs(&def, &with, &empty).unwrap();
+        assert_eq!(resolved["base"], "hi");
+        assert_eq!(resolved["derived"], "hi-x");
+        assert_eq!(resolved["extra"], "passed");
+    }
+
+    #[test]
+    fn resolve_inputs_errors_on_missing_required() {
+        let mut inputs = IndexMap::new();
+        inputs.insert("token".to_string(), action_input(None, true));
+        let def = ActionDef {
+            inputs,
+            outputs: IndexMap::new(),
+            runs: Runs::Composite { steps: Vec::new() },
+        };
+        let empty = make_context(
+            &IndexMap::new(),
+            &Value::Null,
+            &Value::Null,
+            &IndexMap::new(),
+            &IndexMap::new(),
+            JobStatus::Success,
+        );
+        let err = resolve_inputs(&def, &IndexMap::new(), &empty).unwrap_err();
+        assert!(format!("{err:#}").contains("required"));
+    }
+
+    #[test]
+    fn resolve_action_classifies_references() {
+        let ws = Path::new("/nonexistent-workspace-xyz");
+        assert!(matches!(
+            resolve_action("actions/checkout@v4", ws).unwrap(),
+            ResolvedAction::Unsupported(_)
+        ));
+        assert!(matches!(
+            resolve_action("docker://alpine", ws).unwrap(),
+            ResolvedAction::Unsupported(_)
+        ));
+        // Local but missing action.yml → a clean error, not a panic.
+        assert!(resolve_action("./missing-action", ws).is_err());
     }
 
     #[test]

@@ -52,8 +52,30 @@ pub struct Job {
     pub defaults: Defaults,
     /// The raw `if:` condition expression, if any (evaluated in a later milestone).
     pub if_cond: Option<String>,
+    /// A `strategy.matrix`, if the job is a matrix job.
+    pub strategy: Option<Strategy>,
     /// The job's steps, in order.
     pub steps: Vec<Step>,
+}
+
+/// A job's `strategy:` (the matrix and its knobs).
+#[derive(Debug, Clone)]
+pub struct Strategy {
+    /// The matrix, if present.
+    pub matrix: Option<Matrix>,
+    /// Whether a failing combination cancels the rest (default `true`).
+    pub fail_fast: bool,
+}
+
+/// A `strategy.matrix`: dimensions plus `include`/`exclude` (scalar values in v0).
+#[derive(Debug, Clone, Default)]
+pub struct Matrix {
+    /// Dimension name → its list of values.
+    pub dimensions: IndexMap<String, Vec<String>>,
+    /// `include` entries (each a set of key/value pairs).
+    pub include: Vec<IndexMap<String, String>>,
+    /// `exclude` entries (each a set of key/value pairs).
+    pub exclude: Vec<IndexMap<String, String>>,
 }
 
 /// A single step: either a `run:` command or a `uses:` action.

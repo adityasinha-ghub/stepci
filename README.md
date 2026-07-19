@@ -145,7 +145,10 @@ the common functions. Deferred or approximate:
     without `shell:` defaults to bash (GitHub requires it).
 - **Native execution inherits your host environment** and runs on your host OS
   (`runs-on` is informational). Convenient, but not a hermetic Ubuntu runner.
-- **`matrix`, service containers, and artifacts** are not supported yet.
+- **`matrix`** runs sequentially (`max-parallel` is ignored) with scalar values
+  (objects as matrix values aren't supported); `include` merge semantics are a
+  close approximation of GitHub's. **Service containers and artifacts** aren't
+  supported yet.
 - The `github` context is populated best-effort from local git (`sha`, `ref`,
   `ref_name`) with `event_name` defaulting to `push`.
 - `$GITHUB_ENV`/`$GITHUB_OUTPUT` files are read without a size cap.
@@ -196,7 +199,7 @@ is the secret.
 - [x] Remote action fetching (`owner/repo@ref`, git-cached) — remote composite actions run
 - [x] JavaScript actions (host Node runtime, `INPUT_*`/outputs/`GITHUB_ACTION_PATH`)
 - [x] Docker actions (`docker://` + `Dockerfile` build, workspace mount, channel writeback) — *the one place Docker is used*
-- [ ] `matrix` strategy
+- [x] `matrix` strategy (cartesian product, `include`/`exclude`, `fail-fast`, `matrix` context)
 - [ ] Artifacts & `actions/cache`; service containers
 - [ ] Fidelity/hardening (JS `pre`/`post`, stdout `::commands::`, `hashFiles`, real-workflow testing)
 - [ ] Session recording → replayable script; **publish**

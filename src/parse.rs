@@ -12,8 +12,8 @@ use serde_yaml::Value as Yaml;
 use std::path::Path;
 
 use crate::model::{
-    ActionDef, ActionInput, ActionOutput, Conditional, Defaults, Job, Runs, Step, StepAction,
-    Workflow,
+    ActionDef, ActionInput, ActionOutput, Conditional, Defaults, Job, Matrix, Runs, Step,
+    StepAction, Strategy, Workflow,
 };
 
 /// Read and parse a workflow file from disk.
@@ -73,8 +73,16 @@ struct RawJob {
     defaults: RawDefaults,
     #[serde(rename = "if")]
     if_cond: Option<String>,
+    strategy: Option<RawStrategy>,
     #[serde(default)]
     steps: Vec<RawStep>,
+}
+
+#[derive(Deserialize)]
+struct RawStrategy {
+    matrix: Option<IndexMap<String, Yaml>>,
+    #[serde(rename = "fail-fast")]
+    fail_fast: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -130,6 +138,11 @@ impl RawJob {
                 .with_context(|| format!("in step {}", i + 1))?;
             steps.push(step);
         }
+        let strategy = self
+            .strategy
+            .map(RawStrategy::into_strategy)
+            .transpose()
+            .context("invalid `strategy`")?;
         Ok(Job {
             id,
             name: self.name,
@@ -138,9 +151,65 @@ impl RawJob {
             env: scalar_map(self.env, "job `env`")?,
             defaults: self.defaults.into(),
             if_cond: self.if_cond,
+            strategy,
             steps,
         })
     }
+}
+
+impl RawStrategy {
+    fn into_strategy(self) -> Result<Strategy> {
+        let matrix = self.matrix.map(parse_matrix).transpose()?;
+        Ok(Strategy {
+            matrix,
+            fail_fast: self.fail_fast.unwrap_or(true),
+        })
+    }
+}
+
+/// Parse a `strategy.matrix`: dimension keys map to lists; `include`/`exclude`
+/// are lists of key/value maps. Values are coerced to strings (v0 scalar support).
+fn parse_matrix(raw: IndexMap<String, Yaml>) -> Result<Matrix> {
+    let mut m = Matrix::default();
+    for (key, val) in raw {
+        match key.as_str() {
+            "include" => m.include = parse_matrix_maps(val, "include")?,
+            "exclude" => m.exclude = parse_matrix_maps(val, "exclude")?,
+            _ => {
+                let Yaml::Sequence(seq) = val else {
+                    bail!("matrix dimension `{key}` must be a list");
+                };
+                let values = seq
+                    .iter()
+                    .map(scalar_to_string)
+                    .collect::<Result<Vec<_>>>()
+                    .with_context(|| format!("matrix dimension `{key}`"))?;
+                m.dimensions.insert(key, values);
+            }
+        }
+    }
+    Ok(m)
+}
+
+fn parse_matrix_maps(val: Yaml, ctx: &str) -> Result<Vec<IndexMap<String, String>>> {
+    let Yaml::Sequence(seq) = val else {
+        bail!("matrix `{ctx}` must be a list");
+    };
+    let mut out = Vec::with_capacity(seq.len());
+    for entry in seq {
+        let Yaml::Mapping(map) = entry else {
+            bail!("each matrix `{ctx}` entry must be a mapping");
+        };
+        let mut row = IndexMap::new();
+        for (k, v) in map {
+            let Yaml::String(key) = k else {
+                bail!("matrix `{ctx}` keys must be strings");
+            };
+            row.insert(key, scalar_to_string(&v)?);
+        }
+        out.push(row);
+    }
+    Ok(out)
 }
 
 impl RawStep {

@@ -77,8 +77,9 @@ pub fn run_workflow(wf: &Workflow, opts: &RunOptions) -> Result<i32> {
 
     let mut quit = false;
     let mut results: IndexMap<String, JobResult> = IndexMap::new();
-    for id in &order {
+    'jobs: for id in &order {
         let job = &wf.jobs[id];
+        let label = job.name.as_deref().unwrap_or(&job.id);
         // A job's implicit `success()` means every needed job succeeded.
         let needs_ok = single
             || job
@@ -91,44 +92,81 @@ pub fn run_workflow(wf: &Workflow, opts: &RunOptions) -> Result<i32> {
             JobStatus::Failure
         };
 
-        let should_run = match &job.if_cond {
-            Some(cond) => {
-                let jctx = make_job_context(
-                    wf,
-                    &results,
-                    job,
-                    &github,
-                    &runner,
-                    &opts.secrets,
-                    ctx_status,
-                );
-                eval_condition(cond, &jctx)?
-            }
-            None => needs_ok,
-        };
-        if !should_run {
-            let why = if needs_ok {
-                "if condition false"
-            } else {
-                "a needed job did not succeed"
-            };
-            println!("\n● job {id}: skipped ({why})");
+        // A needed job failed and there's no `if:` to override → skip the whole job.
+        if !needs_ok && job.if_cond.is_none() {
+            println!("\n● job {id}: skipped (a needed job did not succeed)");
             results.insert(id.clone(), JobResult::Skipped);
             continue;
         }
 
-        let (status, flow) = run_job(job, wf, &github, &runner, opts, interactive)?;
-        let result = if status == JobStatus::Success {
-            JobResult::Success
-        } else {
-            JobResult::Failed
+        // Expand the matrix (a non-matrix job is one empty combination).
+        let combos = match job.strategy.as_ref().and_then(|s| s.matrix.as_ref()) {
+            Some(m) => expand_matrix(m),
+            None => vec![IndexMap::new()],
         };
-        results.insert(id.clone(), result);
-        if flow == Flow::Quit {
-            println!("\n(quit — remaining jobs not run)");
-            quit = true;
-            break;
+        let fail_fast = job.strategy.as_ref().map(|s| s.fail_fast).unwrap_or(true);
+        if combos.is_empty() {
+            println!("\n● job {id}: skipped (matrix produced no combinations)");
+            results.insert(id.clone(), JobResult::Skipped);
+            continue;
         }
+
+        let mut job_result = JobResult::Skipped; // upgraded once a combo runs
+        for combo in &combos {
+            let suffix = if combo.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " [{}]",
+                    combo.values().cloned().collect::<Vec<_>>().join(", ")
+                )
+            };
+            let matrix_ctx: IndexMap<String, Value> = combo
+                .iter()
+                .map(|(k, v)| (k.clone(), Value::Str(v.clone())))
+                .collect();
+
+            let should_run = match &job.if_cond {
+                Some(cond) => {
+                    let jctx = make_job_context(
+                        wf,
+                        &results,
+                        job,
+                        &github,
+                        &runner,
+                        &opts.secrets,
+                        &matrix_ctx,
+                        ctx_status,
+                    );
+                    eval_condition(cond, &jctx)?
+                }
+                None => needs_ok,
+            };
+            if !should_run {
+                println!("\n● job {id}{suffix}: skipped (if condition false)");
+                continue;
+            }
+
+            println!("\n● job {id}{suffix} ({label})");
+            let (status, flow) =
+                run_job(job, wf, &github, &runner, opts, interactive, &matrix_ctx)?;
+            if status == JobStatus::Failure {
+                job_result = JobResult::Failed;
+            } else if job_result == JobResult::Skipped {
+                job_result = JobResult::Success;
+            }
+            if flow == Flow::Quit {
+                results.insert(id.clone(), job_result);
+                println!("\n(quit — remaining jobs not run)");
+                quit = true;
+                break 'jobs;
+            }
+            if status == JobStatus::Failure && fail_fast && combos.len() > 1 {
+                println!("  (fail-fast: skipping the remaining matrix combinations)");
+                break;
+            }
+        }
+        results.insert(id.clone(), job_result);
     }
 
     // A real failure outranks a user quit; a clean quit is reported as 130
@@ -161,6 +199,53 @@ fn warn_unknown_breakpoints(wf: &Workflow, opts: &RunOptions) {
     }
 }
 
+/// Expand a `strategy.matrix` into concrete combinations: the cartesian product
+/// of its dimensions, then `exclude` removals, then `include` merges/additions.
+fn expand_matrix(m: &crate::model::Matrix) -> Vec<IndexMap<String, String>> {
+    let mut combos: Vec<IndexMap<String, String>> = vec![IndexMap::new()];
+    for (dim, values) in &m.dimensions {
+        let mut next = Vec::new();
+        for combo in &combos {
+            for v in values {
+                let mut c = combo.clone();
+                c.insert(dim.clone(), v.clone());
+                next.push(c);
+            }
+        }
+        combos = next;
+    }
+    if m.dimensions.is_empty() {
+        combos.clear(); // no base product; only `include` entries become combos
+    }
+
+    combos.retain(|combo| {
+        !m.exclude
+            .iter()
+            .any(|ex| ex.iter().all(|(k, v)| combo.get(k) == Some(v)))
+    });
+
+    for inc in &m.include {
+        // Keys of the include that are also dimensions must match to merge.
+        let dim_keys: Vec<&String> = inc
+            .keys()
+            .filter(|k| m.dimensions.contains_key(*k))
+            .collect();
+        let mut merged = false;
+        for combo in combos.iter_mut() {
+            if dim_keys.iter().all(|k| combo.get(*k) == inc.get(*k)) {
+                for (k, v) in inc {
+                    combo.insert(k.clone(), v.clone());
+                }
+                merged = true;
+            }
+        }
+        if !merged {
+            combos.push(inc.clone());
+        }
+    }
+    combos
+}
+
 /// Reject a `needs` that references a job the workflow doesn't define — GitHub
 /// rejects these, and silently ignoring them would run jobs out of order.
 fn validate_needs(wf: &Workflow) -> Result<()> {
@@ -176,6 +261,7 @@ fn validate_needs(wf: &Workflow) -> Result<()> {
 
 /// Build the evaluation context for a job-level `if:` — `needs.<job>.result`,
 /// plus github/runner/env and the needs-derived status.
+#[allow(clippy::too_many_arguments)]
 fn make_job_context(
     wf: &Workflow,
     results: &IndexMap<String, JobResult>,
@@ -183,6 +269,7 @@ fn make_job_context(
     github: &Value,
     runner: &Value,
     secrets: &IndexMap<String, String>,
+    matrix: &IndexMap<String, Value>,
     status: JobStatus,
 ) -> Context {
     let mut needs = IndexMap::new();
@@ -211,6 +298,7 @@ fn make_job_context(
     vars.insert("needs".to_string(), Value::Object(needs));
     vars.insert("job".to_string(), Value::Object(job_obj));
     vars.insert("secrets".to_string(), str_object(secrets));
+    vars.insert("matrix".to_string(), Value::Object(matrix.clone()));
     Context { vars, status }
 }
 
@@ -222,6 +310,8 @@ struct JobState {
     path: Vec<String>,
     /// The `steps` context: id → `{ outputs, outcome, conclusion }`.
     steps: IndexMap<String, Value>,
+    /// The `matrix` context for this job run (empty for non-matrix jobs).
+    matrix: IndexMap<String, Value>,
     /// Running job status, which drives `if:` and the status functions.
     status: JobStatus,
 }
@@ -233,14 +323,13 @@ fn run_job(
     runner: &Value,
     opts: &RunOptions,
     interactive: bool,
+    matrix: &IndexMap<String, Value>,
 ) -> Result<(JobStatus, Flow)> {
-    let label = job.name.as_deref().unwrap_or(&job.id);
-    println!("\n● job {} ({label})", job.id);
-
     let mut state = JobState {
         env: IndexMap::new(),
         path: Vec::new(),
         steps: IndexMap::new(),
+        matrix: matrix.clone(),
         status: JobStatus::Success,
     };
 
@@ -284,7 +373,7 @@ fn run_step(
 ) -> Result<Flow> {
     // Step env is layered over the job env for this step only.
     let mut step_env = state.env.clone();
-    let ctx0 = make_context(
+    let mut ctx0 = make_context(
         &step_env,
         github,
         runner,
@@ -292,10 +381,12 @@ fn run_step(
         &opts.secrets,
         state.status,
     );
+    ctx0.vars
+        .insert("matrix".to_string(), Value::Object(state.matrix.clone()));
     for (k, v) in &step.env {
         step_env.insert(k.clone(), expr::interpolate(v, &ctx0)?);
     }
-    let ctx = make_context(
+    let mut ctx = make_context(
         &step_env,
         github,
         runner,
@@ -303,6 +394,8 @@ fn run_step(
         &opts.secrets,
         state.status,
     );
+    ctx.vars
+        .insert("matrix".to_string(), Value::Object(state.matrix.clone()));
 
     let label = step_label(step);
     print!("  ▸ step {number}: {label} … ");
@@ -1358,7 +1451,7 @@ fn layer_env(
     secrets: &IndexMap<String, String>,
 ) -> Result<()> {
     for (k, v) in entries {
-        let ctx = make_context(
+        let mut ctx = make_context(
             &state.env,
             github,
             runner,
@@ -1366,6 +1459,8 @@ fn layer_env(
             secrets,
             state.status,
         );
+        ctx.vars
+            .insert("matrix".to_string(), Value::Object(state.matrix.clone()));
         let value = expr::interpolate(v, &ctx)?;
         state.env.insert(k.clone(), value);
     }
@@ -1692,6 +1787,68 @@ mod tests {
             default: default.map(str::to_string),
             required,
         }
+    }
+
+    fn matrix(text: &str) -> crate::model::Matrix {
+        let wf = crate::parse::parse_str(&format!(
+            "jobs:\n  j:\n    runs-on: x\n    strategy:\n{}\n    steps: [{{ run: 'true' }}]\n",
+            text.lines()
+                .map(|l| format!("      {l}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ))
+        .unwrap();
+        wf.jobs["j"]
+            .strategy
+            .clone()
+            .unwrap()
+            .matrix
+            .clone()
+            .unwrap()
+    }
+
+    fn combo_strings(combos: &[IndexMap<String, String>]) -> Vec<String> {
+        combos
+            .iter()
+            .map(|c| {
+                c.iter()
+                    .map(|(k, v)| format!("{k}={v}"))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn matrix_cartesian_exclude_include() {
+        let m = matrix("matrix:\n  os: [linux, mac]\n  v: [1, 2]");
+        assert_eq!(
+            combo_strings(&expand_matrix(&m)),
+            vec!["os=linux,v=1", "os=linux,v=2", "os=mac,v=1", "os=mac,v=2"]
+        );
+
+        // exclude removes a combination.
+        let m = matrix(
+            "matrix:\n  os: [linux, mac]\n  v: [1, 2]\n  exclude:\n    - os: mac\n      v: 1",
+        );
+        assert_eq!(
+            combo_strings(&expand_matrix(&m)),
+            vec!["os=linux,v=1", "os=linux,v=2", "os=mac,v=2"]
+        );
+
+        // include with only new keys adds them to every combination.
+        let m = matrix("matrix:\n  v: [1, 2]\n  include:\n    - extra: x");
+        assert_eq!(
+            combo_strings(&expand_matrix(&m)),
+            vec!["v=1,extra=x", "v=2,extra=x"]
+        );
+
+        // include that matches no combination is appended as a new one.
+        let m = matrix("matrix:\n  v: [1]\n  include:\n    - v: 9\n      note: added");
+        assert_eq!(
+            combo_strings(&expand_matrix(&m)),
+            vec!["v=1", "v=9,note=added"]
+        );
     }
 
     #[test]

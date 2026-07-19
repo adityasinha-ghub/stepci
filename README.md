@@ -132,11 +132,13 @@ the common functions. Deferred or approximate:
 - **`uses:` actions:** local **and remote** (`owner/repo@ref`, git-fetched into
   `~/.cache/stepci`) **composite**, **JavaScript**, and **Docker** actions run
   (inputs, defaults, `INPUT_*`, outputs, `$GITHUB_ENV` propagation).
-  - JS actions use the **host `node`** (version isn't pinned to `node16`/`node20`);
-    `pre`/`post` hooks and stdout `::workflow-commands::` (e.g. legacy
-    `::set-output::`) aren't handled yet — actions using the file-based
-    `$GITHUB_OUTPUT`/`$GITHUB_ENV` work. Actions needing a real token/full event
-    payload (e.g. `checkout` on a private repo) may not fully succeed.
+  - JS actions use the **host `node`** (version isn't pinned to `node16`/`node20`).
+    Both the file channels (`$GITHUB_OUTPUT`/`$GITHUB_ENV`/`$GITHUB_PATH`) **and**
+    stdout `::workflow-commands::` are handled — `set-output` (incl. the legacy
+    form), `add-mask`, and `error`/`warning`/`notice`/`group`/`debug` annotations.
+    `pre`/`post` hooks aren't run yet, the deprecated stdout `set-env`/`add-path`
+    are ignored (use the file channels), and actions needing a real token/full
+    event payload (e.g. `checkout` on a private repo) may not fully succeed.
   - **Docker** actions are the *only* place Docker is used: `docker://image` and
     `Dockerfile` builds, workspace mounted at `/github/workspace`, with channel
     writeback. Containers run as root (host files they create are root-owned);
@@ -187,11 +189,12 @@ stepci run ci.yml --secret-file .secrets
 #   DB_URL=vault://secret/data/app#db_url
 ```
 
-**Known limits:** masking covers stepci's *own* output (diff, `info`) — a step's
-own stdout/stderr streams directly and is **not** masked (same as running the
-command yourself). Values shorter than 4 chars aren't masked (to avoid garbling
-output). The secret file has no inline `#` comments — the whole value after `=`
-is the secret.
+**Known limits:** stepci's own output (diff, `info`) and a step's **stdout** are
+masked — both known secrets and any values a step registers with `::add-mask::`,
+which mask the rest of that step's stream (as on GitHub, masking can't apply
+retroactively). A step's **stderr** streams directly and is not masked. Values
+shorter than 4 chars aren't masked (to avoid garbling output). The secret file
+has no inline `#` comments — the whole value after `=` is the secret.
 
 ## Roadmap
 
@@ -208,7 +211,8 @@ is the secret.
 - [x] Docker actions (`docker://` + `Dockerfile` build, workspace mount, channel writeback) — *the one place Docker is used*
 - [x] `matrix` strategy (cartesian product, `include`/`exclude`, `fail-fast`, `matrix` context)
 - [ ] Artifacts & `actions/cache`; service containers
-- [ ] Fidelity/hardening (JS `pre`/`post`, stdout `::commands::`, `hashFiles`, real-workflow testing)
+- [x] Stdout `::workflow-commands::` (`set-output`, `add-mask`, annotations) with live stream masking
+- [ ] Fidelity/hardening (JS `pre`/`post`, `hashFiles`, real-workflow testing)
 - [ ] Session recording → replayable script; **publish**
 
 ## Install

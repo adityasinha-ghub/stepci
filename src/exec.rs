@@ -3,14 +3,15 @@
 //! [`crate::expr`], and propagating `$GITHUB_ENV`/`$GITHUB_PATH`/`$GITHUB_OUTPUT`
 //! between steps like the real runner.
 //!
-//! `run:` steps and local **composite** `uses:` actions run natively; remote,
-//! JavaScript, and Docker actions are reported as skipped (they arrive in later
-//! milestones). Output streams straight through to the terminal.
+//! `run:` steps and composite, JavaScript, and Docker `uses:` actions run (local
+//! and remote); Docker is used only for Docker actions. A step's stdout is
+//! streamed through while being scanned for `::workflow-command::` lines (e.g.
+//! `set-output`, `add-mask`), matching the runner's second back-channel.
 
 use std::collections::HashSet;
-use std::io::{BufRead, IsTerminal, Write};
+use std::io::{BufRead, BufReader, IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, ExitStatus, Stdio};
 
 use anyhow::{Context as _, Result, bail};
 use indexmap::IndexMap;
@@ -23,6 +24,7 @@ use crate::fetch;
 use crate::model::{ActionDef, Conditional, Job, Runs, Step, StepAction, Workflow};
 use crate::parse;
 use crate::value::Value;
+use crate::wfcmd;
 
 /// Cap on files walked per workspace snapshot, so a huge tree can't hang a step.
 const MAX_DIFF_FILES: usize = 20_000;
@@ -467,7 +469,16 @@ fn run_step(
     let path_before = state.path.clone();
     let fs_before = diff::snapshot_fs(&opts.workspace, MAX_DIFF_FILES);
 
-    let io = execute_script(shell, &script, &cwd, &step_env, &state.path, github, runner)?;
+    let io = execute_script(
+        shell,
+        &script,
+        &cwd,
+        &step_env,
+        &state.path,
+        github,
+        runner,
+        &opts.secrets,
+    )?;
 
     // Apply everything the step exported, regardless of exit status.
     for (k, v) in &io.env_additions {
@@ -711,9 +722,8 @@ fn run_node_action(
     cmd.env("GITHUB_STEP_SUMMARY", summary_file.path());
     cmd.env("GITHUB_ACTION_PATH", action_dir);
 
-    let status = cmd
-        .status()
-        .map_err(|e| anyhow::anyhow!("failed to run `node` (is Node.js installed?): {e}"))?;
+    let (status, scan) = run_capturing(cmd, &opts.secrets)
+        .map_err(|e| anyhow::anyhow!("running `node` (is Node.js installed?): {e:#}"))?;
 
     for (k, v) in read_key_values(env_file.path())? {
         state.env.insert(k, v);
@@ -721,7 +731,11 @@ fn run_node_action(
     for p in read_path_additions(path_file.path())? {
         state.path.insert(0, p);
     }
-    let outputs: IndexMap<String, String> = read_key_values(out_file.path())?.into_iter().collect();
+    let mut outputs: IndexMap<String, String> =
+        read_key_values(out_file.path())?.into_iter().collect();
+    for (k, v) in scan.outputs {
+        outputs.insert(k, v);
+    }
     Ok((outputs, status.success()))
 }
 
@@ -852,7 +866,11 @@ fn run_docker_action(
         run.push(expr::interpolate(a, &ictx)?);
     }
 
-    let status = docker_run(&run)?;
+    // Capture the container's stdout for workflow commands, like a native step.
+    let mut dcmd = Command::new("docker");
+    dcmd.args(&run);
+    let (status, scan) = run_capturing(dcmd, &opts.secrets)
+        .map_err(|e| anyhow::anyhow!("running docker (is it installed and running?): {e:#}"))?;
 
     // Read the mounted channel files back.
     let read = |name: &str| std::fs::read_to_string(chan.path().join(name)).unwrap_or_default();
@@ -862,9 +880,12 @@ fn run_docker_action(
     for p in envfile::parse_path_additions(&read("path")) {
         state.path.insert(0, p);
     }
-    let outputs: IndexMap<String, String> = envfile::parse_key_values(&read("output"))?
+    let mut outputs: IndexMap<String, String> = envfile::parse_key_values(&read("output"))?
         .into_iter()
         .collect();
+    for (k, v) in scan.outputs {
+        outputs.insert(k, v);
+    }
     Ok((outputs, status.success()))
 }
 
@@ -1004,7 +1025,16 @@ fn run_composite(
         }
 
         println!();
-        let io = execute_script(shell, &script, &cwd, &step_env, &state.path, github, runner)?;
+        let io = execute_script(
+            shell,
+            &script,
+            &cwd,
+            &step_env,
+            &state.path,
+            github,
+            runner,
+            &opts.secrets,
+        )?;
         for (k, v) in &io.env_additions {
             state.env.insert(k.clone(), v.clone());
         }
@@ -1284,7 +1314,134 @@ fn clip(s: &str) -> String {
     }
 }
 
-/// Build the command and run it, streaming stdout/stderr to the terminal.
+/// Outputs harvested from a child's stdout `::workflow-command::` lines.
+#[derive(Default)]
+struct ScanResult {
+    /// `::set-output name=NAME::VALUE` pairs, in emission order.
+    outputs: Vec<(String, String)>,
+}
+
+/// Run `cmd`, streaming the child's stdout to ours line-by-line while parsing
+/// GitHub `::workflow commands::`. `set-output` is harvested; `add-mask` masks
+/// the rest of this run's stream; `error`/`warning`/`notice`/`group`/`debug` are
+/// rendered; deprecated stdout `set-env`/`add-path` are ignored (their file
+/// channels are honored instead); every other line prints through, with known
+/// secrets and any `add-mask` values masked. stderr is left inherited (the
+/// runner reads commands only from stdout). Piping stdout also matches GitHub,
+/// where a step's stdout is not a TTY.
+fn run_capturing(
+    mut cmd: Command,
+    secrets: &IndexMap<String, String>,
+) -> Result<(ExitStatus, ScanResult)> {
+    cmd.stdout(Stdio::piped());
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("failed to launch step process: {e}"))?;
+    let stdout = child.stdout.take().expect("stdout was piped");
+
+    let mut masks: Vec<String> = secrets.values().filter(|v| v.len() >= 4).cloned().collect();
+    masks.sort_by_key(|v| std::cmp::Reverse(v.len()));
+
+    let mut result = ScanResult::default();
+    let handle = std::io::stdout();
+    let mut reader = BufReader::new(stdout);
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        // Read raw bytes so non-UTF-8 output degrades to lossy text rather than
+        // aborting the step.
+        let n = reader
+            .read_until(b'\n', &mut buf)
+            .context("reading step stdout")?;
+        if n == 0 {
+            break;
+        }
+        let cow = String::from_utf8_lossy(&buf);
+        let mut line: &str = cow.as_ref();
+        if let Some(s) = line.strip_suffix('\n') {
+            line = s;
+        }
+        if let Some(s) = line.strip_suffix('\r') {
+            line = s;
+        }
+
+        if let Some(command) = wfcmd::parse(line) {
+            match command.name.as_str() {
+                "set-output" => {
+                    if let Some(name) = command.param("name") {
+                        result
+                            .outputs
+                            .push((name.to_string(), command.message.clone()));
+                    }
+                    continue;
+                }
+                // Parsed but unused until pre/post hooks land.
+                "save-state" => continue,
+                "add-mask" => {
+                    if command.message.len() >= 4 {
+                        masks.push(command.message.clone());
+                        masks.sort_by_key(|v| std::cmp::Reverse(v.len()));
+                    }
+                    continue;
+                }
+                // Disabled on GitHub as stdout commands; the file channels win.
+                "set-env" | "add-path" | "echo" | "stop-commands" => continue,
+                "error" | "warning" | "notice" => {
+                    render_annotation(&handle, &command, &masks);
+                    continue;
+                }
+                "group" => {
+                    let mut o = handle.lock();
+                    let _ = writeln!(o, "  ▸ {}", mask_line(&command.message, &masks));
+                    continue;
+                }
+                "endgroup" => continue,
+                "debug" => {
+                    let mut o = handle.lock();
+                    let _ = writeln!(o, "  ::debug:: {}", mask_line(&command.message, &masks));
+                    continue;
+                }
+                // An unrecognized command name: fall through and print it raw.
+                _ => {}
+            }
+        }
+        let mut o = handle.lock();
+        let _ = writeln!(o, "{}", mask_line(line, &masks));
+    }
+
+    let status = child
+        .wait()
+        .map_err(|e| anyhow::anyhow!("waiting for step process: {e}"))?;
+    Ok((status, result))
+}
+
+/// Render an `error`/`warning`/`notice` annotation with its `file:line` if given.
+fn render_annotation(handle: &std::io::Stdout, command: &wfcmd::Command, masks: &[String]) {
+    let label = match command.name.as_str() {
+        "error" => "✗ error",
+        "warning" => "⚠ warning",
+        _ => "notice",
+    };
+    let loc = match (command.param("file"), command.param("line")) {
+        (Some(f), Some(l)) => format!(" ({f}:{l})"),
+        (Some(f), None) => format!(" ({f})"),
+        _ => String::new(),
+    };
+    let mut o = handle.lock();
+    let _ = writeln!(o, "  {label}{loc}: {}", mask_line(&command.message, masks));
+}
+
+/// Replace each masked value in a passthrough line with `***` (longest first, so
+/// a secret that is a substring of another can't leave the longer one exposed).
+fn mask_line(s: &str, masks: &[String]) -> String {
+    let mut out = s.to_string();
+    for m in masks {
+        out = out.replace(m.as_str(), "***");
+    }
+    out
+}
+
+/// Build the command and run it, capturing stdout for workflow commands.
 #[allow(clippy::too_many_arguments)]
 fn spawn_step(
     shell: &str,
@@ -1298,7 +1455,8 @@ fn spawn_step(
     out_file: &NamedTempFile,
     path_file: &NamedTempFile,
     summary_file: &NamedTempFile,
-) -> Result<std::process::ExitStatus> {
+    secrets: &IndexMap<String, String>,
+) -> Result<(ExitStatus, ScanResult)> {
     let mut script_file = NamedTempFile::new().context("creating step script file")?;
     script_file
         .write_all(script.as_bytes())
@@ -1317,10 +1475,9 @@ fn spawn_step(
     cmd.env("GITHUB_PATH", path_file.path());
     cmd.env("GITHUB_STEP_SUMMARY", summary_file.path());
 
-    let status = cmd
-        .status()
-        .map_err(|e| anyhow::anyhow!("failed to launch shell `{program}` for the step: {e}"))?;
-    Ok(status)
+    // `script_file` stays alive until `run_capturing` returns (the child has
+    // exited by then), so the shell can still read it.
+    run_capturing(cmd, secrets).with_context(|| format!("launching shell `{program}` for the step"))
 }
 
 /// The results of running one shell script: its exit status plus whatever it
@@ -1333,7 +1490,9 @@ struct StepIo {
 }
 
 /// Run a script through the shell with fresh channel files, and read the channels
-/// back. Shared by ordinary `run:` steps and composite-action steps.
+/// back. Shared by ordinary `run:` steps and composite-action steps. Outputs
+/// combine the `$GITHUB_OUTPUT` file with any stdout `::set-output::` commands.
+#[allow(clippy::too_many_arguments)]
 fn execute_script(
     shell: &str,
     script: &str,
@@ -1342,13 +1501,14 @@ fn execute_script(
     path: &[String],
     github: &Value,
     runner: &Value,
+    secrets: &IndexMap<String, String>,
 ) -> Result<StepIo> {
     let env_file = NamedTempFile::new().context("creating GITHUB_ENV file")?;
     let out_file = NamedTempFile::new().context("creating GITHUB_OUTPUT file")?;
     let path_file = NamedTempFile::new().context("creating GITHUB_PATH file")?;
     let summary_file = NamedTempFile::new().context("creating GITHUB_STEP_SUMMARY file")?;
 
-    let status = spawn_step(
+    let (status, scan) = spawn_step(
         shell,
         script,
         cwd,
@@ -1360,13 +1520,17 @@ fn execute_script(
         &out_file,
         &path_file,
         &summary_file,
+        secrets,
     )?;
+
+    let mut outputs = read_key_values(out_file.path())?;
+    outputs.extend(scan.outputs);
 
     Ok(StepIo {
         status,
         env_additions: read_key_values(env_file.path())?,
         path_additions: read_path_additions(path_file.path())?,
-        outputs: read_key_values(out_file.path())?,
+        outputs,
     })
 }
 

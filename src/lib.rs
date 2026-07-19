@@ -17,3 +17,4 @@ pub mod model;
 pub mod parse;
 pub mod secrets;
 pub mod value;
+pub mod wfcmd;

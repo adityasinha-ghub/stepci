@@ -171,7 +171,11 @@ the common functions. Deferred or approximate:
   offline, with no real upload. Common inputs (`name`, `path` incl. globs and
   directories, `if-no-files-found`, download `path`, name-less "download all")
   are handled; exclude (`!`) patterns, retention, and compression are not.
-  **`actions/cache` and service containers** aren't supported yet.
+- **`actions/cache`** (and `cache/restore`, `cache/save`) is treated as a clean
+  **miss** — it emits `cache-hit: false` (so `if:` guards run the real work) and
+  does nothing else. A local cache can't populate until `pre`/`post` hooks land
+  (GitHub saves the cache in a post-step), so a no-op is the honest behavior
+  rather than a half-working shim. **Service containers** aren't supported yet.
 - The `github` context is populated best-effort from local git (`sha`, `ref`,
   `ref_name`) with `event_name` defaulting to `push`.
 - `$GITHUB_ENV`/`$GITHUB_OUTPUT` files are read without a size cap.
@@ -227,7 +231,8 @@ has no inline `#` comments — the whole value after `=` is the secret.
 - [ ] Artifacts & `actions/cache`; service containers
 - [x] Stdout `::workflow-commands::` (`set-output`, `add-mask`, annotations) with live stream masking
 - [x] Artifacts — `upload-artifact`/`download-artifact` via a run-local store (cross-job, offline)
-- [ ] `actions/cache`; service containers
+- [x] `actions/cache` — treated as a clean miss (`cache-hit: false`) until `pre`/`post` land
+- [ ] Service containers (`services:`)
 - [ ] Fidelity/hardening (JS `pre`/`post`, `hashFiles`, real-workflow testing)
 - [ ] Session recording → replayable script; **publish**
 

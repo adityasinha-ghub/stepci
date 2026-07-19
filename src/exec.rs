@@ -613,6 +613,12 @@ fn run_uses_step(
     if let Some(art) = artifact::kind(reference) {
         return run_artifact_shim(step, number, state, opts, reference, with, ctx, art);
     }
+    // `actions/cache` saves in a post-step we don't run, so a local cache could
+    // never populate — treat it as a clean miss instead of letting the real
+    // action fail against the absent cache service.
+    if is_cache_action(reference) {
+        return run_cache_noop(step, number, state, reference);
+    }
 
     #[derive(Clone, Copy)]
     enum Kind {
@@ -740,6 +746,31 @@ fn run_artifact_shim(
         (false, _) => println!("  ✗ step {number} failed"),
     }
     print_diff(&env_delta, &fs_delta, &opts.secrets);
+    Ok(Flow::Continue)
+}
+
+/// Whether a `uses:` reference is one of the `actions/cache` family.
+fn is_cache_action(reference: &str) -> bool {
+    matches!(
+        reference.split('@').next().unwrap_or(reference),
+        "actions/cache" | "actions/cache/restore" | "actions/cache/save"
+    )
+}
+
+/// Treat an `actions/cache` step as a clean miss: report it, emit
+/// `cache-hit: false` so downstream `if:` guards run the real work, and move on.
+fn run_cache_noop(
+    step: &Step,
+    number: usize,
+    state: &mut JobState,
+    reference: &str,
+) -> Result<Flow> {
+    println!("  ┌ `{reference}` (cache isn't backed locally — treated as a miss)");
+    println!("  └ end `{reference}`");
+    let mut outputs = IndexMap::new();
+    outputs.insert("cache-hit".to_string(), "false".to_string());
+    record_step(state, step, "success", "success", outputs);
+    println!("  ✓ step {number} ok");
     Ok(Flow::Continue)
 }
 

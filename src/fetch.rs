@@ -78,10 +78,22 @@ pub fn cache_root() -> Result<PathBuf> {
 /// Fetch the action's repo at its ref into the cache (reusing a prior fetch) and
 /// return the directory containing its `action.yml`.
 pub fn fetch(r: &RemoteRef, cache_root: &Path) -> Result<PathBuf> {
-    let safe_ref = r.git_ref.replace(['/', '\\'], "_");
-    let repo_dir = cache_root.join(&r.owner).join(&r.repo).join(&safe_ref);
+    let repo_dir = cache_root
+        .join(&r.owner)
+        .join(&r.repo)
+        .join(cache_dir_name(&r.git_ref));
 
-    if !repo_dir.join(".git").is_dir() {
+    // A sentinel written only after a fully-successful fetch marks the cache as
+    // usable. If it's absent but the dir exists, a prior fetch was interrupted
+    // (partial/corrupt `.git`) — clear it and start clean, rather than serving
+    // half-fetched action code.
+    let sentinel = repo_dir.join(".stepci-complete");
+    if !sentinel.exists() {
+        if repo_dir.exists() {
+            std::fs::remove_dir_all(&repo_dir).with_context(|| {
+                format!("clearing incomplete cache dir `{}`", repo_dir.display())
+            })?;
+        }
         std::fs::create_dir_all(&repo_dir)
             .with_context(|| format!("creating cache dir `{}`", repo_dir.display()))?;
         let url = format!("https://github.com/{}/{}", r.owner, r.repo);
@@ -94,12 +106,26 @@ pub fn fetch(r: &RemoteRef, cache_root: &Path) -> Result<PathBuf> {
         )
         .with_context(|| format!("fetching `{}/{}@{}`", r.owner, r.repo, r.git_ref))?;
         run_git(&repo_dir, &["checkout", "-q", "FETCH_HEAD"])?;
+        std::fs::File::create(&sentinel)
+            .with_context(|| format!("writing cache sentinel `{}`", sentinel.display()))?;
     }
 
     Ok(match &r.subpath {
         Some(sub) => repo_dir.join(sub),
         None => repo_dir,
     })
+}
+
+/// A collision-free cache directory name for a git ref. Path separators are
+/// flattened for readability, but a short hash of the *raw* ref is appended so
+/// two distinct refs (e.g. `refs/tags/v1` and `refs_tags/v1`) can never share a
+/// directory — which would otherwise serve one ref's code for the other.
+fn cache_dir_name(git_ref: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    git_ref.hash(&mut h);
+    let flat = git_ref.replace(['/', '\\'], "_");
+    format!("{flat}-{:x}", h.finish())
 }
 
 fn run_git(dir: &Path, args: &[&str]) -> Result<()> {
@@ -150,6 +176,19 @@ mod tests {
         assert_eq!(parse_remote("actions/checkout"), None); // no ref
         assert_eq!(parse_remote("noslash@v1"), None); // no repo
         assert_eq!(parse_remote("owner/repo@"), None); // empty ref
+    }
+
+    #[test]
+    fn cache_dir_name_is_stable_and_collision_free() {
+        // Stable across calls (so the cache is reused, not re-fetched each run).
+        assert_eq!(cache_dir_name("v4"), cache_dir_name("v4"));
+        // Distinct refs that flatten to the same string must not collide.
+        assert_ne!(
+            cache_dir_name("refs/tags/v1"),
+            cache_dir_name("refs_tags/v1")
+        );
+        // The readable prefix is still present.
+        assert!(cache_dir_name("refs/tags/v1").starts_with("refs_tags_v1-"));
     }
 
     #[test]

@@ -143,12 +143,19 @@ the common functions. Deferred or approximate:
     `services:`/`container:` jobs aren't supported yet.
   - Nested `uses:` inside a composite is skipped, and a composite `run:` step
     without `shell:` defaults to bash (GitHub requires it).
+  - Remote actions are **cached by ref** under `~/.cache/stepci/actions` and not
+    re-fetched while cached. A *moving* ref (a branch, or a major tag like `v4`
+    that gets repointed) therefore stays pinned to the first-fetched commit until
+    you clear the cache (`rm -rf ~/.cache/stepci`). Immutable refs (a full SHA or
+    a fixed tag) are unaffected.
 - **Native execution inherits your host environment** and runs on your host OS
   (`runs-on` is informational). Convenient, but not a hermetic Ubuntu runner.
 - **`matrix`** runs sequentially (`max-parallel` is ignored) with scalar values
-  (objects as matrix values aren't supported); `include` merge semantics are a
-  close approximation of GitHub's. **Service containers and artifacts** aren't
-  supported yet.
+  (objects as matrix values aren't supported). `include`/`exclude` follow
+  GitHub's documented rules — includes match against the base product only, add
+  or extend combinations without overwriting original dimension values, and
+  become standalone entries when they match nothing (verified against GitHub's
+  reference example). **Service containers and artifacts** aren't supported yet.
 - The `github` context is populated best-effort from local git (`sha`, `ref`,
   `ref_name`) with `event_name` defaulting to `push`.
 - `$GITHUB_ENV`/`$GITHUB_OUTPUT` files are read without a size cap.

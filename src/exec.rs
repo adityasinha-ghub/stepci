@@ -224,8 +224,13 @@ fn expand_matrix(m: &crate::model::Matrix) -> Vec<IndexMap<String, String>> {
             .any(|ex| ex.iter().all(|(k, v)| combo.get(k) == Some(v)))
     });
 
+    // Each `include` merges into the base combinations whose original-dimension
+    // values it matches (adding/overwriting only non-dimension keys), and if it
+    // matches none it becomes a standalone combination. Matching considers only
+    // the base product — never combos an earlier `include` appended — matching
+    // GitHub, so several includes that each add a new value stay distinct.
+    let mut extra: Vec<IndexMap<String, String>> = Vec::new();
     for inc in &m.include {
-        // Keys of the include that are also dimensions must match to merge.
         let dim_keys: Vec<&String> = inc
             .keys()
             .filter(|k| m.dimensions.contains_key(*k))
@@ -240,9 +245,10 @@ fn expand_matrix(m: &crate::model::Matrix) -> Vec<IndexMap<String, String>> {
             }
         }
         if !merged {
-            combos.push(inc.clone());
+            extra.push(inc.clone());
         }
     }
+    combos.extend(extra);
     combos
 }
 
@@ -416,7 +422,7 @@ fn run_step(
         StepAction::Run { script } => expr::interpolate(script, &ctx)?,
         StepAction::Uses { action, with } => {
             return run_uses_step(
-                step, number, state, github, runner, opts, action, with, &ctx,
+                step, number, state, &step_env, github, runner, opts, action, with, &ctx,
             );
         }
     };
@@ -577,6 +583,7 @@ fn run_uses_step(
     step: &Step,
     number: usize,
     state: &mut JobState,
+    step_env: &IndexMap<String, String>,
     github: &Value,
     runner: &Value,
     opts: &RunOptions,
@@ -623,9 +630,11 @@ fn run_uses_step(
             let Runs::Node { main, .. } = &def.runs else {
                 unreachable!("resolved as Node")
             };
-            run_node_action(main, &dir, &inputs, state, github, runner, opts)?
+            run_node_action(main, &dir, &inputs, step_env, state, github, runner, opts)?
         }
-        Kind::Docker => run_docker_action(&def, &dir, &inputs, state, github, runner, opts)?,
+        Kind::Docker => {
+            run_docker_action(&def, &dir, &inputs, step_env, state, github, runner, opts)?
+        }
     };
     println!("  └ end `{reference}`");
 
@@ -662,6 +671,7 @@ fn run_node_action(
     main: &str,
     action_dir: &Path,
     inputs: &IndexMap<String, String>,
+    base_env: &IndexMap<String, String>,
     state: &mut JobState,
     github: &Value,
     runner: &Value,
@@ -678,7 +688,8 @@ fn run_node_action(
     let state_file = NamedTempFile::new().context("creating GITHUB_STATE file")?;
     let summary_file = NamedTempFile::new().context("creating GITHUB_STEP_SUMMARY file")?;
 
-    let mut step_env = state.env.clone();
+    // The action's environment: the job+step env, then this action's `INPUT_*`.
+    let mut step_env = base_env.clone();
     for (k, v) in input_env_vars(inputs) {
         step_env.insert(k, v);
     }
@@ -721,10 +732,12 @@ fn run_node_action(
 /// This is the one place we shell out to Docker (the "Docker only when required"
 /// stance). Containers run as root, so files they create in the workspace are
 /// root-owned on the host.
+#[allow(clippy::too_many_arguments)]
 fn run_docker_action(
     def: &ActionDef,
     action_dir: &Path,
     inputs: &IndexMap<String, String>,
+    base_env: &IndexMap<String, String>,
     state: &mut JobState,
     github: &Value,
     runner: &Value,
@@ -740,10 +753,13 @@ fn run_docker_action(
         return Ok((IndexMap::new(), true));
     };
 
-    // Resolve the image: build a `Dockerfile`, else use it as a prebuilt name.
+    // Resolve the image. `docker://name` is a prebuilt registry image; otherwise
+    // a value naming a file that exists under the action (e.g. `Dockerfile`,
+    // `./Dockerfile`, `build/Containerfile`) is built; anything else is treated
+    // as a prebuilt image name.
     let image_name = if let Some(img) = image.strip_prefix("docker://") {
         img.to_string()
-    } else if image == "Dockerfile" || image.ends_with("/Dockerfile") {
+    } else if action_dir.join(image).is_file() {
         let dockerfile = action_dir.join(image);
         let tag = docker_tag(action_dir);
         println!("  │ building image from {}", dockerfile.display());
@@ -784,7 +800,7 @@ fn run_docker_action(
 
     // Env: INPUT_*, the action's own env, and the reserved runner variables.
     let ictx = make_context_with_inputs(
-        &state.env,
+        base_env,
         github,
         runner,
         &IndexMap::new(),
@@ -792,7 +808,13 @@ fn run_docker_action(
         inputs,
         JobStatus::Success,
     );
-    let mut env = input_env_vars(inputs);
+    // The container's environment: the job+step env, then `INPUT_*`, then the
+    // action's own `runs.env` (as on GitHub, which passes job/workflow env into
+    // container actions too).
+    let mut env = base_env.clone();
+    for (k, v) in input_env_vars(inputs) {
+        env.insert(k, v);
+    }
     for (k, v) in docker_env {
         env.insert(k.clone(), expr::interpolate(v, &ictx)?);
     }
@@ -1369,6 +1391,9 @@ fn apply_common_env(
     if let Some(arch) = object_get(runner, "arch") {
         cmd.env("RUNNER_ARCH", arch);
     }
+    if let Some(temp) = object_get(runner, "temp") {
+        cmd.env("RUNNER_TEMP", temp);
+    }
     for (var, key) in [
         ("GITHUB_SHA", "sha"),
         ("GITHUB_REF", "ref"),
@@ -1848,6 +1873,42 @@ mod tests {
         assert_eq!(
             combo_strings(&expand_matrix(&m)),
             vec!["v=1", "v=9,note=added"]
+        );
+    }
+
+    #[test]
+    fn matrix_includes_only_match_base_combinations() {
+        // Two includes that each fail to match the base product (os is never
+        // `mac`) must stay DISTINCT — the second must not merge into the combo
+        // the first appended. GitHub matches includes against the base product
+        // only, so this yields 4 combinations, not 3.
+        let m = matrix(
+            "matrix:\n  os: [linux, win]\n  include:\n    - os: mac\n      gpu: nvidia\n    - os: mac\n      cuda: '12'",
+        );
+        assert_eq!(
+            combo_strings(&expand_matrix(&m)),
+            vec!["os=linux", "os=win", "os=mac,gpu=nvidia", "os=mac,cuda=12"]
+        );
+    }
+
+    #[test]
+    fn matrix_matches_github_include_reference_example() {
+        // The canonical example from GitHub's matrix docs, which exercises every
+        // include rule: add-to-all, match-subset, add-new-key, and non-matching
+        // includes becoming their own combinations.
+        let m = matrix(
+            "matrix:\n  fruit: [apple, pear]\n  animal: [cat, dog]\n  include:\n    - color: green\n    - color: pink\n      animal: cat\n    - fruit: apple\n      shape: circle\n    - fruit: banana\n    - fruit: banana\n      animal: cat",
+        );
+        assert_eq!(
+            combo_strings(&expand_matrix(&m)),
+            vec![
+                "fruit=apple,animal=cat,color=pink,shape=circle",
+                "fruit=apple,animal=dog,color=green,shape=circle",
+                "fruit=pear,animal=cat,color=pink",
+                "fruit=pear,animal=dog,color=green",
+                "fruit=banana",
+                "fruit=banana,animal=cat",
+            ]
         );
     }
 

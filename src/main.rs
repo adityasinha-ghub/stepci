@@ -41,6 +41,15 @@ struct RunArgs {
     /// Pause before steps with these ids (repeatable).
     #[arg(long = "break", value_name = "STEP_ID")]
     breakpoints: Vec<String>,
+
+    /// Load secrets from a dotenv-style file (values may be `op://…`/`vault://…`).
+    #[arg(long = "secret-file", value_name = "PATH")]
+    secret_file: Option<PathBuf>,
+
+    /// A secret as `NAME=VALUE`, or bare `NAME` to read it from the environment
+    /// (repeatable). `op://…`/`vault://…` values are resolved via their CLIs.
+    #[arg(long = "secret", value_name = "NAME[=VALUE]")]
+    secrets: Vec<String>,
 }
 
 fn main() {
@@ -60,12 +69,14 @@ fn try_main() -> Result<()> {
 
 fn run(args: RunArgs) -> Result<()> {
     let workflow = parse::parse_file(&args.workflow)?;
+    let secrets = stepci::secrets::load_secrets(args.secret_file.as_deref(), &args.secrets)?;
 
     let opts = RunOptions {
         job: args.job,
         workspace: std::env::current_dir().context("getting the current directory")?,
         step_all: args.step,
         breakpoints: args.breakpoints,
+        secrets,
     };
     let code = exec::run_workflow(&workflow, &opts)?;
     std::process::exit(code);

@@ -35,6 +35,8 @@ pub struct RunOptions {
     pub step_all: bool,
     /// Pause before steps whose id is in this list.
     pub breakpoints: Vec<String>,
+    /// Resolved secrets, exposed to expressions as `secrets.NAME`.
+    pub secrets: IndexMap<String, String>,
 }
 
 /// What to do after a step: keep going, or the user asked to quit the run.
@@ -88,7 +90,15 @@ pub fn run_workflow(wf: &Workflow, opts: &RunOptions) -> Result<i32> {
 
         let should_run = match &job.if_cond {
             Some(cond) => {
-                let jctx = make_job_context(wf, &results, job, &github, &runner, ctx_status);
+                let jctx = make_job_context(
+                    wf,
+                    &results,
+                    job,
+                    &github,
+                    &runner,
+                    &opts.secrets,
+                    ctx_status,
+                );
                 eval_condition(cond, &jctx)?
             }
             None => needs_ok,
@@ -169,6 +179,7 @@ fn make_job_context(
     job: &Job,
     github: &Value,
     runner: &Value,
+    secrets: &IndexMap<String, String>,
     status: JobStatus,
 ) -> Context {
     let mut needs = IndexMap::new();
@@ -184,11 +195,6 @@ fn make_job_context(
         needs.insert(n.clone(), Value::Object(obj));
     }
 
-    let env_obj: IndexMap<String, Value> = wf
-        .env
-        .iter()
-        .map(|(k, v)| (k.clone(), Value::Str(v.clone())))
-        .collect();
     let mut job_obj = IndexMap::new();
     job_obj.insert(
         "status".to_string(),
@@ -198,9 +204,10 @@ fn make_job_context(
     let mut vars = IndexMap::new();
     vars.insert("github".to_string(), github.clone());
     vars.insert("runner".to_string(), runner.clone());
-    vars.insert("env".to_string(), Value::Object(env_obj));
+    vars.insert("env".to_string(), str_object(&wf.env));
     vars.insert("needs".to_string(), Value::Object(needs));
     vars.insert("job".to_string(), Value::Object(job_obj));
+    vars.insert("secrets".to_string(), str_object(secrets));
     Context { vars, status }
 }
 
@@ -236,8 +243,8 @@ fn run_job(
 
     // Layer workflow then job env, interpolating each value as it's added so it
     // can reference earlier entries and the github/runner contexts.
-    layer_env(&mut state, &wf.env, github, runner)?;
-    layer_env(&mut state, &job.env, github, runner)?;
+    layer_env(&mut state, &wf.env, github, runner, &opts.secrets)?;
+    layer_env(&mut state, &job.env, github, runner, &opts.secrets)?;
 
     for (i, step) in job.steps.iter().enumerate() {
         let flow = run_step(
@@ -274,11 +281,25 @@ fn run_step(
 ) -> Result<Flow> {
     // Step env is layered over the job env for this step only.
     let mut step_env = state.env.clone();
-    let ctx0 = make_context(&step_env, github, runner, &state.steps, state.status);
+    let ctx0 = make_context(
+        &step_env,
+        github,
+        runner,
+        &state.steps,
+        &opts.secrets,
+        state.status,
+    );
     for (k, v) in &step.env {
         step_env.insert(k.clone(), expr::interpolate(v, &ctx0)?);
     }
-    let ctx = make_context(&step_env, github, runner, &state.steps, state.status);
+    let ctx = make_context(
+        &step_env,
+        github,
+        runner,
+        &state.steps,
+        &opts.secrets,
+        state.status,
+    );
 
     let label = step_label(step);
     print!("  ▸ step {number}: {label} … ");
@@ -327,6 +348,7 @@ fn run_step(
             &state.path,
             github,
             runner,
+            &opts.secrets,
         )? {
             Decision::Run => {}
             Decision::Skip => {
@@ -405,8 +427,29 @@ fn run_step(
         }
         (false, _) => println!("  ✗ step {number} failed (exit {code})"),
     }
-    print_diff(&env_delta, &fs_delta);
+    print_diff(&env_delta, &fs_delta, &opts.secrets);
     Ok(Flow::Continue)
+}
+
+/// Replace any secret value (of a meaningful length) appearing in `s` with `***`,
+/// so secrets that interpolation baked into env/scripts don't leak in our output.
+///
+/// Longest values are masked first, so a secret that is a substring of another
+/// can't leave the longer one only partially masked. Note: a step's own
+/// stdout/stderr streams directly and is NOT masked.
+fn mask_secrets(s: &str, secrets: &IndexMap<String, String>) -> String {
+    let mut values: Vec<&str> = secrets
+        .values()
+        .map(String::as_str)
+        .filter(|v| v.len() >= 4)
+        .collect();
+    values.sort_by_key(|v| std::cmp::Reverse(v.len()));
+
+    let mut out = s.to_string();
+    for v in values {
+        out = out.replace(v, "***");
+    }
+    out
 }
 
 /// Whether to pause before this step, given the run's flags.
@@ -439,6 +482,7 @@ fn pause_before(
     path: &[String],
     github: &Value,
     runner: &Value,
+    secrets: &IndexMap<String, String>,
 ) -> Result<Decision> {
     println!("  ⏸  paused before step {number}: {label}");
     println!("     shell: {shell}   cwd: {}", cwd.display());
@@ -458,7 +502,7 @@ fn pause_before(
             "" | "c" | "continue" => return Ok(Decision::Run),
             "k" | "skip" => return Ok(Decision::Skip),
             "q" | "quit" => return Ok(Decision::Quit),
-            "i" | "info" => print_step_info(script, step_env),
+            "i" | "info" => print_step_info(script, step_env, secrets),
             // A shell that fails to launch must not tear down the run — report
             // and re-prompt, so the debugger stays alive.
             "s" | "shell" => {
@@ -471,16 +515,21 @@ fn pause_before(
     }
 }
 
-/// Print the resolved script and the step's environment overrides.
-fn print_step_info(script: &str, step_env: &IndexMap<String, String>) {
+/// Print the resolved script and the step's environment overrides, masking any
+/// secret values that interpolation baked in.
+fn print_step_info(
+    script: &str,
+    step_env: &IndexMap<String, String>,
+    secrets: &IndexMap<String, String>,
+) {
     println!("     ── script ──");
     for l in script.lines() {
-        println!("     {l}");
+        println!("     {}", mask_secrets(l, secrets));
     }
     if !step_env.is_empty() {
         println!("     ── env ──");
         for (k, v) in step_env {
-            println!("     {k}={}", clip(v));
+            println!("     {k}={}", clip(&mask_secrets(v, secrets)));
         }
     }
 }
@@ -505,15 +554,20 @@ fn drop_into_shell(
     Ok(())
 }
 
-/// Print the per-step env + filesystem diff (the wedge), omitting empty sections.
-fn print_diff(env: &EnvDiff, fs: &FsDiff) {
+/// Print the per-step env + filesystem diff (the wedge), omitting empty sections
+/// and masking any secret values.
+fn print_diff(env: &EnvDiff, fs: &FsDiff, secrets: &IndexMap<String, String>) {
     if !env.is_empty() {
         println!("    env:");
         for (k, v) in &env.added {
-            println!("      + {k} = {}", clip(v));
+            println!("      + {k} = {}", clip(&mask_secrets(v, secrets)));
         }
         for (k, old, new) in &env.changed {
-            println!("      ~ {k}: {} → {}", clip(old), clip(new));
+            println!(
+                "      ~ {k}: {} → {}",
+                clip(&mask_secrets(old, secrets)),
+                clip(&mask_secrets(new, secrets))
+            );
         }
         for k in &env.removed {
             println!("      - {k}");
@@ -525,15 +579,18 @@ fn print_diff(env: &EnvDiff, fs: &FsDiff) {
     if !fs.is_empty() {
         println!("    files:");
         for e in &fs.added {
-            println!("      + {}", fmt_entry(e));
+            println!("      + {}", mask_secrets(&fmt_entry(e), secrets));
         }
         for e in &fs.removed {
-            println!("      - {}", fmt_entry(e));
+            println!("      - {}", mask_secrets(&fmt_entry(e), secrets));
         }
         // Modified lists can get long; show a bounded number.
         const MAX_MODIFIED: usize = 50;
         for p in fs.modified.iter().take(MAX_MODIFIED) {
-            println!("      ~ {}", p.display());
+            println!(
+                "      ~ {}",
+                mask_secrets(&p.display().to_string(), secrets)
+            );
         }
         if fs.modified.len() > MAX_MODIFIED {
             println!(
@@ -705,9 +762,17 @@ fn layer_env(
     entries: &IndexMap<String, String>,
     github: &Value,
     runner: &Value,
+    secrets: &IndexMap<String, String>,
 ) -> Result<()> {
     for (k, v) in entries {
-        let ctx = make_context(&state.env, github, runner, &state.steps, state.status);
+        let ctx = make_context(
+            &state.env,
+            github,
+            runner,
+            &state.steps,
+            secrets,
+            state.status,
+        );
         let value = expr::interpolate(v, &ctx)?;
         state.env.insert(k.clone(), value);
     }
@@ -768,12 +833,9 @@ fn make_context(
     github: &Value,
     runner: &Value,
     steps: &IndexMap<String, Value>,
+    secrets: &IndexMap<String, String>,
     status: JobStatus,
 ) -> Context {
-    let env_obj: IndexMap<String, Value> = env
-        .iter()
-        .map(|(k, v)| (k.clone(), Value::Str(v.clone())))
-        .collect();
     let mut job = IndexMap::new();
     job.insert(
         "status".to_string(),
@@ -781,13 +843,22 @@ fn make_context(
     );
 
     let mut vars = IndexMap::new();
-    vars.insert("env".to_string(), Value::Object(env_obj));
+    vars.insert("env".to_string(), str_object(env));
     vars.insert("github".to_string(), github.clone());
     vars.insert("runner".to_string(), runner.clone());
     vars.insert("job".to_string(), Value::Object(job));
     vars.insert("steps".to_string(), Value::Object(steps.clone()));
-    vars.insert("secrets".to_string(), Value::Object(IndexMap::new()));
+    vars.insert("secrets".to_string(), str_object(secrets));
     Context { vars, status }
+}
+
+/// A `String -> String` map as a `Value::Object` of string values.
+fn str_object(map: &IndexMap<String, String>) -> Value {
+    Value::Object(
+        map.iter()
+            .map(|(k, v)| (k.clone(), Value::Str(v.clone())))
+            .collect(),
+    )
 }
 
 fn status_str(status: JobStatus) -> &'static str {
@@ -943,7 +1014,32 @@ mod tests {
             workspace: ".".into(),
             step_all,
             breakpoints: breakpoints.iter().map(|s| s.to_string()).collect(),
+            secrets: IndexMap::new(),
         }
+    }
+
+    #[test]
+    fn secrets_are_masked_in_output() {
+        let mut secrets = IndexMap::new();
+        secrets.insert("TOKEN".to_string(), "s3cr3t-value".to_string());
+        assert_eq!(
+            mask_secrets("using s3cr3t-value here", &secrets),
+            "using *** here"
+        );
+        // Very short values aren't masked (avoids garbling common text).
+        let mut short = IndexMap::new();
+        short.insert("X".to_string(), "ab".to_string());
+        assert_eq!(mask_secrets("ab cd", &short), "ab cd");
+    }
+
+    #[test]
+    fn overlapping_secrets_are_fully_masked() {
+        // A shorter secret that is a substring of a longer one (inserted first)
+        // must NOT leave the longer one partially unmasked (`***XY99`).
+        let mut secrets = IndexMap::new();
+        secrets.insert("SHORT".to_string(), "secret".to_string());
+        secrets.insert("LONG".to_string(), "secretXY99".to_string());
+        assert_eq!(mask_secrets("token=secretXY99", &secrets), "token=***");
     }
 
     #[test]

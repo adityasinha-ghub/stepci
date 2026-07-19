@@ -6,8 +6,9 @@
 > ⚠️ **Status: early — works, but incomplete.** `stepci run` executes a workflow's
 > `run:` steps natively (evaluating `if:`, interpolating `${{ }}`, propagating
 > `$GITHUB_ENV`/`$GITHUB_OUTPUT`), shows a **per-step diff** of what changed, and
-> can **pause** for an interactive shell. Not built yet: `uses:` actions and
-> **secret managers**. This README is honest about that. See [Roadmap](#roadmap).
+> can **pause** for an interactive shell, and resolves **secrets** (including
+> `op://`/`vault://` references). Not built yet: `uses:` actions. This README is
+> honest about that. See [Roadmap](#roadmap).
 
 **A native, Dockerless debugger for GitHub Actions — step through a workflow run
 on your own machine, see exactly what each step changed, using your real secrets.**
@@ -150,6 +151,27 @@ the common functions. Deferred or approximate:
 - The env diff reflects what a step exported via `$GITHUB_ENV`/`$GITHUB_PATH` —
   not variables the step's shell set only for itself (those don't persist).
 
+## Secrets
+
+Provide secrets for `${{ secrets.NAME }}`; they're masked in stepci's own output.
+
+```bash
+# Inline, from the environment, or a dotenv-style file:
+stepci run ci.yml --secret API_KEY=xyz
+stepci run ci.yml --secret API_KEY                 # reads $API_KEY
+stepci run ci.yml --secret-file .secrets
+
+# Values can be 1Password / Vault references, resolved via their CLIs:
+#   API_KEY=op://Private/API/credential
+#   DB_URL=vault://secret/data/app#db_url
+```
+
+**Known limits:** masking covers stepci's *own* output (diff, `info`) — a step's
+own stdout/stderr streams directly and is **not** masked (same as running the
+command yourself). Values shorter than 4 chars aren't masked (to avoid garbling
+output). The secret file has no inline `#` comments — the whole value after `=`
+is the secret.
+
 ## Roadmap
 
 - [x] Workflow parser (jobs, steps, `run:`/`uses:`) with located, actionable errors
@@ -158,9 +180,9 @@ the common functions. Deferred or approximate:
 - [x] Per-step environment **diff** (exported vars + `PATH` additions)
 - [x] Per-step filesystem **diff** (added/removed/modified, new dirs collapsed)
 - [x] Interactive debugger loop (`--step`/`--break`: pause / shell / info / skip / quit)
-- [ ] Secrets: env + 1Password / Vault
+- [x] Secrets: `--secret`/`--secret-file`, with `op://` (1Password) & `vault://` resolution + output masking
 - [ ] Session recording → replayable script
-- [ ] *(stretch)* Docker/JS `uses:` actions; macOS; matrix
+- [ ] *(stretch)* `uses:` actions (Docker/JS/composite); matrix; service containers
 
 ## Install
 

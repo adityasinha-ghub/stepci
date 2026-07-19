@@ -14,4 +14,5 @@ pub mod exec;
 pub mod expr;
 pub mod model;
 pub mod parse;
+pub mod secrets;
 pub mod value;

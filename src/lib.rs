@@ -8,6 +8,7 @@
 //! the fiddly pure logic (parsing, expression evaluation) can be unit-tested in
 //! isolation.
 
+pub mod diff;
 pub mod envfile;
 pub mod exec;
 pub mod expr;

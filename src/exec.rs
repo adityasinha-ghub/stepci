@@ -15,10 +15,14 @@ use anyhow::{Context as _, Result, bail};
 use indexmap::IndexMap;
 use tempfile::NamedTempFile;
 
+use crate::diff::{self, Entry, EnvDiff, FsDiff};
 use crate::envfile;
 use crate::expr::{self, Context, JobStatus};
 use crate::model::{Conditional, Job, Step, StepAction, Workflow};
 use crate::value::Value;
+
+/// Cap on files walked per workspace snapshot, so a huge tree can't hang a step.
+const MAX_DIFF_FILES: usize = 20_000;
 
 /// Options for a run.
 pub struct RunOptions {
@@ -249,6 +253,11 @@ fn run_step(
     let path_file = NamedTempFile::new().context("creating GITHUB_PATH file")?;
     let summary_file = NamedTempFile::new().context("creating GITHUB_STEP_SUMMARY file")?;
 
+    // Snapshot before running, so we can diff what the step changed.
+    let env_before = state.env.clone();
+    let path_before = state.path.clone();
+    let fs_before = diff::snapshot_fs(&opts.workspace, MAX_DIFF_FILES);
+
     println!(); // end the "… " line before the step's own output streams
     let status = spawn_step(
         shell,
@@ -273,6 +282,11 @@ fn run_step(
         state.path.insert(0, p); // most recently added wins
     }
     let outputs = read_key_values(out_file.path())?;
+
+    // Diff env + filesystem against the pre-run snapshot.
+    let fs_after = diff::snapshot_fs(&opts.workspace, MAX_DIFF_FILES);
+    let env_delta = diff::env_diff(&env_before, &state.env, &path_before, &state.path);
+    let fs_delta = diff::fs_diff(&fs_before, &fs_after);
 
     let ok = status.success();
     let (outcome, conclusion) = if ok {
@@ -301,7 +315,69 @@ fn run_step(
         }
         (false, _) => println!("  ✗ step {number} failed (exit {code})"),
     }
+    print_diff(&env_delta, &fs_delta);
     Ok(())
+}
+
+/// Print the per-step env + filesystem diff (the wedge), omitting empty sections.
+fn print_diff(env: &EnvDiff, fs: &FsDiff) {
+    if !env.is_empty() {
+        println!("    env:");
+        for (k, v) in &env.added {
+            println!("      + {k} = {}", clip(v));
+        }
+        for (k, old, new) in &env.changed {
+            println!("      ~ {k}: {} → {}", clip(old), clip(new));
+        }
+        for k in &env.removed {
+            println!("      - {k}");
+        }
+        for p in &env.path_added {
+            println!("      + PATH ⊕ {p}");
+        }
+    }
+    if !fs.is_empty() {
+        println!("    files:");
+        for e in &fs.added {
+            println!("      + {}", fmt_entry(e));
+        }
+        for e in &fs.removed {
+            println!("      - {}", fmt_entry(e));
+        }
+        // Modified lists can get long; show a bounded number.
+        const MAX_MODIFIED: usize = 50;
+        for p in fs.modified.iter().take(MAX_MODIFIED) {
+            println!("      ~ {}", p.display());
+        }
+        if fs.modified.len() > MAX_MODIFIED {
+            println!(
+                "      … and {} more modified",
+                fs.modified.len() - MAX_MODIFIED
+            );
+        }
+    }
+    if fs.truncated {
+        println!("    (filesystem diff skipped: workspace exceeds {MAX_DIFF_FILES} files)");
+    }
+}
+
+fn fmt_entry(entry: &Entry) -> String {
+    match entry {
+        Entry::File(p) => p.display().to_string(),
+        Entry::Dir(p, n) => format!("{}/ ({n} files)", p.display()),
+    }
+}
+
+/// Truncate a long value for single-line display.
+fn clip(s: &str) -> String {
+    const MAX: usize = 80;
+    let one_line = s.replace('\n', "⏎");
+    if one_line.chars().count() > MAX {
+        let kept: String = one_line.chars().take(MAX).collect();
+        format!("{kept}…")
+    } else {
+        one_line
+    }
 }
 
 /// Build the command and run it, streaming stdout/stderr to the terminal.

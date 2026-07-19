@@ -22,6 +22,8 @@ indexmap = { version = "2", features = ["serde"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 # Temp files for step scripts and the GITHUB_ENV/OUTPUT/PATH channels.
 tempfile = "3"
+# Recursive workspace walk for the per-step filesystem diff.
+walkdir = "2"
 
 [profile.release]
 strip = true

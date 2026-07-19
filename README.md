@@ -134,13 +134,25 @@ the common functions. Deferred or approximate:
   `ref_name`) with `event_name` defaulting to `push`.
 - `$GITHUB_ENV`/`$GITHUB_OUTPUT` files are read without a size cap.
 
+### Known diff gaps (v0)
+
+- The **filesystem diff is scoped to the workspace** (the directory you run
+  `stepci` in). Changes a step makes outside it — or in a `working-directory`
+  outside the repo — aren't shown.
+- Changes are detected by **size + mtime**; a rewrite that preserves both is
+  missed.
+- Workspaces over 20,000 files (excluding `.git`) **skip** the filesystem diff
+  rather than report an unreliable one.
+- The env diff reflects what a step exported via `$GITHUB_ENV`/`$GITHUB_PATH` —
+  not variables the step's shell set only for itself (those don't persist).
+
 ## Roadmap
 
 - [x] Workflow parser (jobs, steps, `run:`/`uses:`) with located, actionable errors
 - [x] `${{ }}` expression evaluator (operators, coercion, functions, interpolation)
 - [x] Native step executor (`run:` steps: shell, env/output/path propagation, `if:`, `continue-on-error`, job order)
-- [ ] Per-step environment **diff**
-- [ ] Per-step filesystem **diff**
+- [x] Per-step environment **diff** (exported vars + `PATH` additions)
+- [x] Per-step filesystem **diff** (added/removed/modified, new dirs collapsed)
 - [ ] Interactive debugger loop (pause / shell / continue / quit)
 - [ ] Secrets: env + 1Password / Vault
 - [ ] Session recording → replayable script

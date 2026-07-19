@@ -12,7 +12,7 @@ use serde_yaml::Value as Yaml;
 use std::path::Path;
 
 use crate::model::{
-    ActionDef, ActionInput, ActionOutput, Conditional, Defaults, Job, Matrix, Runs, Step,
+    ActionDef, ActionInput, ActionOutput, Conditional, Defaults, Job, Matrix, Runs, Service, Step,
     StepAction, Strategy, Workflow,
 };
 
@@ -75,7 +75,20 @@ struct RawJob {
     if_cond: Option<String>,
     strategy: Option<RawStrategy>,
     #[serde(default)]
+    services: IndexMap<String, RawService>,
+    #[serde(default)]
     steps: Vec<RawStep>,
+}
+
+#[derive(Deserialize)]
+struct RawService {
+    image: String,
+    #[serde(default)]
+    ports: Option<Yaml>,
+    #[serde(default)]
+    env: IndexMap<String, Yaml>,
+    #[serde(default)]
+    options: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -143,6 +156,13 @@ impl RawJob {
             .map(RawStrategy::into_strategy)
             .transpose()
             .context("invalid `strategy`")?;
+        let mut services = IndexMap::with_capacity(self.services.len());
+        for (sid, raw) in self.services {
+            let svc = raw
+                .into_service()
+                .with_context(|| format!("in service `{sid}`"))?;
+            services.insert(sid, svc);
+        }
         Ok(Job {
             id,
             name: self.name,
@@ -152,7 +172,19 @@ impl RawJob {
             defaults: self.defaults.into(),
             if_cond: self.if_cond,
             strategy,
+            services,
             steps,
+        })
+    }
+}
+
+impl RawService {
+    fn into_service(self) -> Result<Service> {
+        Ok(Service {
+            image: self.image,
+            ports: string_or_list(self.ports).context("invalid `ports`")?,
+            env: scalar_map(self.env, "service `env`")?,
+            options: self.options,
         })
     }
 }
@@ -586,6 +618,36 @@ jobs:
             }
             other => panic!("expected uses, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_service_containers() {
+        let wf = parse(
+            r#"
+jobs:
+  j:
+    runs-on: x
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+          - 6380
+        env:
+          NOTE: hi
+        options: --health-cmd "redis-cli ping"
+    steps:
+      - run: 'true'
+"#,
+        );
+        let svc = &wf.jobs["j"].services["redis"];
+        assert_eq!(svc.image, "redis:7-alpine");
+        assert_eq!(svc.ports, vec!["6379:6379".to_string(), "6380".to_string()]);
+        assert_eq!(svc.env["NOTE"], "hi");
+        assert_eq!(
+            svc.options.as_deref(),
+            Some("--health-cmd \"redis-cli ping\"")
+        );
     }
 
     #[test]

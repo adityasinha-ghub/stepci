@@ -54,8 +54,23 @@ pub struct Job {
     pub if_cond: Option<String>,
     /// A `strategy.matrix`, if the job is a matrix job.
     pub strategy: Option<Strategy>,
+    /// Service containers to run alongside the job, keyed by service id.
+    pub services: IndexMap<String, Service>,
     /// The job's steps, in order.
     pub steps: Vec<Step>,
+}
+
+/// A `services.<id>` entry: a container started for the duration of the job.
+#[derive(Debug, Clone)]
+pub struct Service {
+    /// The container image (e.g. `postgres:16`).
+    pub image: String,
+    /// Port mappings, each `HOST:CONTAINER` or a bare `CONTAINER` port.
+    pub ports: Vec<String>,
+    /// Environment variables for the container.
+    pub env: IndexMap<String, String>,
+    /// Extra `docker run` options (`options:`), passed through verbatim.
+    pub options: Option<String>,
 }
 
 /// A job's `strategy:` (the matrix and its knobs).

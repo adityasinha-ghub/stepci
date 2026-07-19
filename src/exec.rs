@@ -351,6 +351,28 @@ fn run_job(
     layer_env(&mut state, &wf.env, github, runner, &opts.secrets)?;
     layer_env(&mut state, &job.env, github, runner, &opts.secrets)?;
 
+    // Start any service containers before the steps, and keep the guard alive
+    // for the whole job so they're torn down however the job ends (including a
+    // step error propagating out via `?`).
+    let _services = if job.services.is_empty() {
+        ServiceGuard::default()
+    } else {
+        let ctx = {
+            let mut c = make_context(
+                &state.env,
+                github,
+                runner,
+                &state.steps,
+                &opts.secrets,
+                state.status,
+            );
+            c.vars
+                .insert("matrix".to_string(), Value::Object(state.matrix.clone()));
+            c
+        };
+        start_services(job, &ctx)?
+    };
+
     for (i, step) in job.steps.iter().enumerate() {
         let flow = run_step(
             step,
@@ -1180,6 +1202,109 @@ fn path_str(p: &Path) -> Result<String> {
     p.to_str()
         .map(String::from)
         .ok_or_else(|| anyhow::anyhow!("path is not valid UTF-8: `{}`", p.display()))
+}
+
+/// Running service containers, torn down (`docker rm -f`) when the job ends —
+/// on success, on a step error propagating out, or on quit.
+#[derive(Default)]
+struct ServiceGuard {
+    ids: Vec<String>,
+}
+
+impl Drop for ServiceGuard {
+    fn drop(&mut self) {
+        for id in &self.ids {
+            let _ = Command::new("docker")
+                .args(["rm", "-f", id])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+    }
+}
+
+/// Start each `services.<id>` container detached, publishing its ports to the
+/// host, and wait briefly for each port to accept connections so the first step
+/// can connect. Native steps reach a service at `localhost:<host-port>` — not by
+/// service name, since steps run on the host rather than the service network.
+fn start_services(job: &Job, ctx: &Context) -> Result<ServiceGuard> {
+    let mut guard = ServiceGuard::default();
+    for (id, svc) in &job.services {
+        let image = expr::interpolate(&svc.image, ctx)?;
+        println!("● service {id}: starting {image}");
+
+        let mut args: Vec<String> = vec!["run".into(), "-d".into(), "--rm".into()];
+        let mut host_ports: Vec<u16> = Vec::new();
+        for p in &svc.ports {
+            let mapping = expr::interpolate(p, ctx)?;
+            let mapping = mapping.trim();
+            // A bare `CONTAINER` port publishes to the same host port; a
+            // `HOST:CONTAINER` mapping is passed through as-is.
+            let published = if mapping.contains(':') {
+                mapping.to_string()
+            } else {
+                format!("{mapping}:{mapping}")
+            };
+            if let Some(hp) = published
+                .split(':')
+                .next()
+                .and_then(|h| h.parse::<u16>().ok())
+            {
+                host_ports.push(hp);
+            }
+            args.push("-p".into());
+            args.push(published);
+        }
+        for (k, v) in &svc.env {
+            args.push("-e".into());
+            args.push(format!("{k}={}", expr::interpolate(v, ctx)?));
+        }
+        if let Some(options) = &svc.options {
+            // Shell-word split so quoted values (e.g. `--health-cmd "pg_isready
+            // -U postgres"`) stay a single argument to `docker run`.
+            let toks = shlex::split(options)
+                .ok_or_else(|| anyhow::anyhow!("service `{id}` has malformed `options:`"))?;
+            args.extend(toks);
+        }
+        args.push(image.clone());
+
+        let out = Command::new("docker").args(&args).output().map_err(|e| {
+            anyhow::anyhow!("failed to run docker (is it installed and running?): {e}")
+        })?;
+        if !out.status.success() {
+            bail!(
+                "starting service `{id}` ({image}): {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        guard
+            .ids
+            .push(String::from_utf8_lossy(&out.stdout).trim().to_string());
+
+        for hp in host_ports {
+            if wait_for_port(hp) {
+                println!("  service {id}: localhost:{hp} ready");
+            } else {
+                println!("  ⚠ service {id}: localhost:{hp} not ready after wait — continuing");
+            }
+        }
+    }
+    Ok(guard)
+}
+
+/// Wait up to ~15s for a TCP port on localhost to accept a connection.
+fn wait_for_port(port: u16) -> bool {
+    use std::net::{SocketAddr, TcpStream};
+    use std::time::{Duration, Instant};
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline {
+        if TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_ok() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    false
 }
 
 /// Compute the inputs a composite action sees: each declared input takes its

@@ -91,8 +91,9 @@ actually would — no container in the way.
 - Stdout `::workflow-commands::` and **artifacts** passed between jobs.
 
 **Explicitly deferred (the README says so until they land):**
-- `actions/cache` and **service containers** (`services:`/`container:`) — these
-  lean on GitHub's hosted services; a native shim is the plan, not emulation.
+- Running a whole job inside a **`container:`** (steps would run via `docker
+  exec` rather than natively — it cuts against the native wedge, so it's on hold).
+  A **real** local `actions/cache` (today it's a clean miss — see below).
 - macOS/Windows runner fidelity (steps run on your host OS; `runs-on` is
   informational).
 - JS `pre`/`post` hooks, `hashFiles()`, and the full `github.event` payload.
@@ -175,7 +176,16 @@ the common functions. Deferred or approximate:
   **miss** — it emits `cache-hit: false` (so `if:` guards run the real work) and
   does nothing else. A local cache can't populate until `pre`/`post` hooks land
   (GitHub saves the cache in a post-step), so a no-op is the honest behavior
-  rather than a half-working shim. **Service containers** aren't supported yet.
+  rather than a half-working shim.
+- **Service containers** (`services:`) start via Docker before the job, with
+  ports published to the host and `options:` (incl. quoted `--health-cmd`)
+  passed through; stepci waits (up to ~15s) for each port to accept connections,
+  then tears the containers down when the job ends. Because steps run **natively
+  on the host**, reach a service at **`localhost:<host-port>`**, not by its
+  service name (there's no shared container network), and map the port
+  explicitly (`ports: ['6379:6379']`) — a bare port is published to the same
+  host port rather than a random one. Docker health checks aren't awaited (the
+  TCP wait stands in); `volumes:`/`credentials:` aren't supported.
 - The `github` context is populated best-effort from local git (`sha`, `ref`,
   `ref_name`) with `event_name` defaulting to `push`.
 - `$GITHUB_ENV`/`$GITHUB_OUTPUT` files are read without a size cap.
@@ -232,7 +242,7 @@ has no inline `#` comments — the whole value after `=` is the secret.
 - [x] Stdout `::workflow-commands::` (`set-output`, `add-mask`, annotations) with live stream masking
 - [x] Artifacts — `upload-artifact`/`download-artifact` via a run-local store (cross-job, offline)
 - [x] `actions/cache` — treated as a clean miss (`cache-hit: false`) until `pre`/`post` land
-- [ ] Service containers (`services:`)
+- [x] Service containers (`services:`) — start via Docker, host-published ports, readiness wait, auto-teardown
 - [ ] Fidelity/hardening (JS `pre`/`post`, `hashFiles`, real-workflow testing)
 - [ ] Session recording → replayable script; **publish**
 

@@ -3,12 +3,15 @@
 [![CI](https://github.com/adityasinha-ghub/stepci/actions/workflows/ci.yml/badge.svg)](https://github.com/adityasinha-ghub/stepci/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-> ⚠️ **Status: early — works, but incomplete.** `stepci run` executes a workflow's
-> `run:` steps natively (evaluating `if:`, interpolating `${{ }}`, propagating
-> `$GITHUB_ENV`/`$GITHUB_OUTPUT`), shows a **per-step diff** of what changed, and
-> can **pause** for an interactive shell, and resolves **secrets** (including
-> `op://`/`vault://` references). Not built yet: `uses:` actions. This README is
-> honest about that. See [Roadmap](#roadmap).
+> ⚠️ **Status: 0.x — broadly working, not yet 1.0.** `stepci run` executes a
+> workflow natively: `run:` steps and **composite, JavaScript, and Docker
+> `uses:` actions** (local *and* remote), `${{ }}` expressions, `if:`/`needs`,
+> **matrix**, and stdout `::workflow-commands::`. It shows a **per-step diff** of
+> what changed, can **pause** for an interactive shell, resolves **secrets**
+> (`op://`/`vault://`), and passes **artifacts** between jobs. Docker is used
+> only for Docker actions. Not yet: `actions/cache`, service containers,
+> macOS/Windows fidelity. This README stays honest about the edges — see
+> [Scope](#scope-honest-boundaries) and [Roadmap](#roadmap).
 
 **A native, Dockerless debugger for GitHub Actions — step through a workflow run
 on your own machine, see exactly what each step changed, using your real secrets.**
@@ -77,23 +80,27 @@ actually would — no container in the way.
 
 ## Scope (honest boundaries)
 
-**v0 targets, deliberately:**
-- Native execution of `run:` steps and composite actions, on **Linux**.
-- `${{ }}` expression evaluation, the standard contexts, and a per-step
-  environment + filesystem diff.
-- An interactive debugger loop: pause, drop into a shell, continue, quit.
-- Secrets from your environment and a real secret manager.
+**What runs today:**
+- Native execution of `run:` steps and **composite / JavaScript / Docker `uses:`
+  actions**, local and remote (`owner/repo@ref`). Docker is used *only* for
+  Docker actions; everything else stays native.
+- `${{ }}` expression evaluation with the standard contexts, `if:`,
+  `continue-on-error`, `needs` ordering, and **matrix** strategies.
+- The per-step environment + filesystem **diff**, the interactive debugger loop
+  (pause / shell / continue / quit), and **secrets** (env + 1Password/Vault).
+- Stdout `::workflow-commands::` and **artifacts** passed between jobs.
 
-**Explicitly deferred (not in v0 — and the README will say so until they land):**
-- Docker-based `uses:` actions and JavaScript actions (native execution can't
-  wrap those in v0).
-- macOS/Windows runners.
-- Matrix builds, artifact upload/download, service containers.
+**Explicitly deferred (the README says so until they land):**
+- `actions/cache` and **service containers** (`services:`/`container:`) — these
+  lean on GitHub's hosted services; a native shim is the plan, not emulation.
+- macOS/Windows runner fidelity (steps run on your host OS; `runs-on` is
+  informational).
+- JS `pre`/`post` hooks, `hashFiles()`, and the full `github.event` payload.
 
-Native execution means we don't reimplement Docker; it also means some real
-workflows won't fully run in v0. We'd rather ship the diff-and-debug experience
-for the common `run:`-heavy case and be honest about the edges than fake broad
-coverage.
+Native execution means we don't reimplement Docker, and steps run on your host
+rather than a hermetic Ubuntu image — convenient and fast, but some workflows
+won't be bit-for-bit identical to GitHub. The [gaps](#known-executor-gaps-v0)
+below are specific about where.
 
 ### Known parser gaps (v0)
 
@@ -157,7 +164,14 @@ the common functions. Deferred or approximate:
   GitHub's documented rules — includes match against the base product only, add
   or extend combinations without overwriting original dimension values, and
   become standalone entries when they match nothing (verified against GitHub's
-  reference example). **Service containers and artifacts** aren't supported yet.
+  reference example).
+- **Artifacts:** `actions/upload-artifact`/`download-artifact` are recognized by
+  name and backed by a **run-local store** (under your temp dir, cleared after
+  the run) instead of GitHub's artifact service — so artifacts pass between jobs
+  offline, with no real upload. Common inputs (`name`, `path` incl. globs and
+  directories, `if-no-files-found`, download `path`, name-less "download all")
+  are handled; exclude (`!`) patterns, retention, and compression are not.
+  **`actions/cache` and service containers** aren't supported yet.
 - The `github` context is populated best-effort from local git (`sha`, `ref`,
   `ref_name`) with `event_name` defaulting to `push`.
 - `$GITHUB_ENV`/`$GITHUB_OUTPUT` files are read without a size cap.
@@ -212,6 +226,8 @@ has no inline `#` comments — the whole value after `=` is the secret.
 - [x] `matrix` strategy (cartesian product, `include`/`exclude`, `fail-fast`, `matrix` context)
 - [ ] Artifacts & `actions/cache`; service containers
 - [x] Stdout `::workflow-commands::` (`set-output`, `add-mask`, annotations) with live stream masking
+- [x] Artifacts — `upload-artifact`/`download-artifact` via a run-local store (cross-job, offline)
+- [ ] `actions/cache`; service containers
 - [ ] Fidelity/hardening (JS `pre`/`post`, `hashFiles`, real-workflow testing)
 - [ ] Session recording → replayable script; **publish**
 

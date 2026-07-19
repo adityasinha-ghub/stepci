@@ -24,6 +24,8 @@ serde_json = { version = "1", features = ["preserve_order"] }
 tempfile = "3"
 # Recursive workspace walk for the per-step filesystem diff.
 walkdir = "2"
+# Glob matching for `upload-artifact` path patterns.
+glob = "0.3"
 
 [profile.release]
 strip = true

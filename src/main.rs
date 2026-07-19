@@ -71,13 +71,19 @@ fn run(args: RunArgs) -> Result<()> {
     let workflow = parse::parse_file(&args.workflow)?;
     let secrets = stepci::secrets::load_secrets(args.secret_file.as_deref(), &args.secrets)?;
 
+    // A per-invocation artifact store (pid-scoped, cleaned up after the run) so
+    // `upload-artifact`/`download-artifact` pass files between jobs locally.
+    let artifacts = std::env::temp_dir().join(format!("stepci-artifacts-{}", std::process::id()));
+
     let opts = RunOptions {
         job: args.job,
         workspace: std::env::current_dir().context("getting the current directory")?,
         step_all: args.step,
         breakpoints: args.breakpoints,
         secrets,
+        artifacts,
     };
     let code = exec::run_workflow(&workflow, &opts)?;
+    let _ = std::fs::remove_dir_all(&opts.artifacts);
     std::process::exit(code);
 }

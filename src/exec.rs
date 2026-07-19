@@ -16,7 +16,9 @@ use std::process::{Command, ExitStatus, Stdio};
 use anyhow::{Context as _, Result, bail};
 use indexmap::IndexMap;
 use tempfile::NamedTempFile;
+use walkdir::WalkDir;
 
+use crate::artifact;
 use crate::diff::{self, Entry, EnvDiff, FsDiff};
 use crate::envfile;
 use crate::expr::{self, Context, JobStatus};
@@ -42,6 +44,9 @@ pub struct RunOptions {
     pub breakpoints: Vec<String>,
     /// Resolved secrets, exposed to expressions as `secrets.NAME`.
     pub secrets: IndexMap<String, String>,
+    /// Run-local store backing the `upload-artifact`/`download-artifact` shims,
+    /// so artifacts pass between jobs without GitHub's artifact service.
+    pub artifacts: PathBuf,
 }
 
 /// What to do after a step: keep going, or the user asked to quit the run.
@@ -604,6 +609,11 @@ fn run_uses_step(
 ) -> Result<Flow> {
     println!(); // end the "… " header line
 
+    // The artifact actions are backed by a local store rather than run for real.
+    if let Some(art) = artifact::kind(reference) {
+        return run_artifact_shim(step, number, state, opts, reference, with, ctx, art);
+    }
+
     #[derive(Clone, Copy)]
     enum Kind {
         Composite,
@@ -672,6 +682,236 @@ fn run_uses_step(
     }
     print_diff(&env_delta, &fs_delta, &opts.secrets);
     Ok(Flow::Continue)
+}
+
+/// Run an `upload-artifact`/`download-artifact` step against the run-local store,
+/// wrapped in the same diff/record framing as a real `uses:` action so a
+/// download's new files show up in the step diff.
+#[allow(clippy::too_many_arguments)]
+fn run_artifact_shim(
+    step: &Step,
+    number: usize,
+    state: &mut JobState,
+    opts: &RunOptions,
+    reference: &str,
+    with: &IndexMap<String, String>,
+    ctx: &Context,
+    kind: artifact::Kind,
+) -> Result<Flow> {
+    let env_before = state.env.clone();
+    let path_before = state.path.clone();
+    let fs_before = diff::snapshot_fs(&opts.workspace, MAX_DIFF_FILES);
+
+    println!("  ┌ artifact action `{reference}` (local shim)");
+    let result = match kind {
+        artifact::Kind::Upload => artifact_upload(with, ctx, opts),
+        artifact::Kind::Download => artifact_download(with, ctx, opts),
+    };
+    let ok = match &result {
+        Ok(msg) => {
+            println!("  │ {msg}");
+            true
+        }
+        Err(e) => {
+            println!("  │ error: {e:#}");
+            false
+        }
+    };
+    println!("  └ end `{reference}`");
+
+    let fs_after = diff::snapshot_fs(&opts.workspace, MAX_DIFF_FILES);
+    let env_delta = diff::env_diff(&env_before, &state.env, &path_before, &state.path);
+    let fs_delta = diff::fs_diff(&fs_before, &fs_after);
+
+    let (outcome, conclusion) = if ok {
+        ("success", "success")
+    } else if step_continues_on_error(step, ctx)? {
+        ("failure", "success")
+    } else {
+        ("failure", "failure")
+    };
+    if conclusion == "failure" {
+        state.status = JobStatus::Failure;
+    }
+    record_step(state, step, outcome, conclusion, IndexMap::new());
+    match (ok, conclusion) {
+        (true, _) => println!("  ✓ step {number} ok"),
+        (false, "success") => println!("  ⚠ step {number} failed — continue-on-error"),
+        (false, _) => println!("  ✗ step {number} failed"),
+    }
+    print_diff(&env_delta, &fs_delta, &opts.secrets);
+    Ok(Flow::Continue)
+}
+
+/// Read a `with:` input for a shim, interpolating `${{ }}` if present.
+fn shim_input(with: &IndexMap<String, String>, ctx: &Context, key: &str) -> Result<Option<String>> {
+    match with.get(key) {
+        Some(raw) => Ok(Some(expr::interpolate(raw, ctx)?)),
+        None => Ok(None),
+    }
+}
+
+/// `upload-artifact`: copy the files matching `path` into the run-local store
+/// under `name`, stripping their common directory (like GitHub).
+fn artifact_upload(
+    with: &IndexMap<String, String>,
+    ctx: &Context,
+    opts: &RunOptions,
+) -> Result<String> {
+    let name = shim_input(with, ctx, "name")?.unwrap_or_else(|| "artifact".to_string());
+    let path_input = shim_input(with, ctx, "path")?
+        .ok_or_else(|| anyhow::anyhow!("upload-artifact requires a `path` input"))?;
+    let if_none = shim_input(with, ctx, "if-no-files-found")?.unwrap_or_else(|| "warn".into());
+
+    let mut matched: Vec<PathBuf> = Vec::new();
+    for line in path_input.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        if let Some(stripped) = line.strip_prefix('!') {
+            // Exclude patterns aren't supported by the shim; note and skip.
+            println!("  │ (ignoring exclude pattern `!{stripped}`)");
+            continue;
+        }
+        let abs = if Path::new(line).is_absolute() {
+            PathBuf::from(line)
+        } else {
+            opts.workspace.join(line)
+        };
+        collect_files(&abs, &mut matched)?;
+    }
+    matched.sort();
+    matched.dedup();
+
+    if matched.is_empty() {
+        return match if_none.as_str() {
+            "error" => bail!("no files matched `{path_input}` (if-no-files-found: error)"),
+            "ignore" => Ok(format!(
+                "no files matched `{path_input}` — nothing uploaded"
+            )),
+            _ => Ok(format!(
+                "⚠ no files matched `{path_input}` — nothing uploaded"
+            )),
+        };
+    }
+
+    let prefix = artifact::common_dir_prefix(&matched);
+    let dest = opts.artifacts.join(&name);
+    if dest.exists() {
+        std::fs::remove_dir_all(&dest)
+            .with_context(|| format!("clearing prior artifact `{name}`"))?;
+    }
+    for file in &matched {
+        let rel = file.strip_prefix(&prefix).unwrap_or(file);
+        let target = dest.join(rel);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent).context("creating artifact directory")?;
+        }
+        std::fs::copy(file, &target)
+            .with_context(|| format!("copying `{}` into artifact", file.display()))?;
+    }
+    Ok(format!(
+        "uploaded {} file(s) as artifact `{name}`",
+        matched.len()
+    ))
+}
+
+/// `download-artifact`: copy files from the run-local store into `path` (the
+/// workspace by default). With no `name`, every artifact is restored under a
+/// directory named after it (like `download-artifact@v4`).
+fn artifact_download(
+    with: &IndexMap<String, String>,
+    ctx: &Context,
+    opts: &RunOptions,
+) -> Result<String> {
+    let name = shim_input(with, ctx, "name")?;
+    let dest = match shim_input(with, ctx, "path")? {
+        Some(p) => {
+            let pp = Path::new(&p);
+            if pp.is_absolute() {
+                pp.to_path_buf()
+            } else {
+                opts.workspace.join(pp)
+            }
+        }
+        None => opts.workspace.clone(),
+    };
+
+    let mut count = 0usize;
+    match name {
+        Some(n) => {
+            let src = opts.artifacts.join(&n);
+            if !src.is_dir() {
+                return Ok(format!(
+                    "⚠ no artifact named `{n}` was uploaded — nothing to download"
+                ));
+            }
+            copy_tree(&src, &dest, &mut count)?;
+            Ok(format!("downloaded {count} file(s) from artifact `{n}`"))
+        }
+        None => {
+            if !opts.artifacts.is_dir() {
+                return Ok("⚠ no artifacts were uploaded — nothing to download".into());
+            }
+            let mut artifacts = 0usize;
+            for entry in std::fs::read_dir(&opts.artifacts).context("reading artifact store")? {
+                let entry = entry?;
+                if entry.path().is_dir() {
+                    copy_tree(&entry.path(), &dest.join(entry.file_name()), &mut count)?;
+                    artifacts += 1;
+                }
+            }
+            Ok(format!(
+                "downloaded {count} file(s) from {artifacts} artifact(s)"
+            ))
+        }
+    }
+}
+
+/// Collect the files a `path` pattern matches: a directory (all files under it),
+/// a plain file, or a glob.
+fn collect_files(pattern: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+    if pattern.is_dir() {
+        push_files_under(pattern, out);
+    } else if pattern.is_file() {
+        out.push(pattern.to_path_buf());
+    } else {
+        let pat = pattern.to_string_lossy();
+        let entries =
+            glob::glob(&pat).map_err(|e| anyhow::anyhow!("bad path pattern `{pat}`: {e}"))?;
+        for entry in entries {
+            let p = entry.map_err(|e| anyhow::anyhow!("matching `{pat}`: {e}"))?;
+            if p.is_dir() {
+                push_files_under(&p, out);
+            } else if p.is_file() {
+                out.push(p);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Push every file under a directory (recursively) into `out`.
+fn push_files_under(dir: &Path, out: &mut Vec<PathBuf>) {
+    for e in WalkDir::new(dir).into_iter().filter_map(Result::ok) {
+        if e.file_type().is_file() {
+            out.push(e.into_path());
+        }
+    }
+}
+
+/// Recursively copy every file from `src` into `dst`, preserving structure.
+fn copy_tree(src: &Path, dst: &Path, count: &mut usize) -> Result<()> {
+    for e in WalkDir::new(src).into_iter().filter_map(Result::ok) {
+        if e.file_type().is_file() {
+            let rel = e.path().strip_prefix(src).unwrap_or(e.path());
+            let target = dst.join(rel);
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent).context("creating download directory")?;
+            }
+            std::fs::copy(e.path(), &target)
+                .with_context(|| format!("restoring `{}`", target.display()))?;
+            *count += 1;
+        }
+    }
+    Ok(())
 }
 
 /// Run a JavaScript action: `node <dir>/<main>` with `INPUT_*` + the standard
@@ -1916,6 +2156,7 @@ mod tests {
             step_all,
             breakpoints: breakpoints.iter().map(|s| s.to_string()).collect(),
             secrets: IndexMap::new(),
+            artifacts: std::env::temp_dir().join("stepci-artifacts-test"),
         }
     }
 

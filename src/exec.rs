@@ -423,6 +423,8 @@ fn run_step(
 enum ResolvedAction {
     /// A composite action: its definition and the directory it lives in.
     Composite(Box<ActionDef>, PathBuf),
+    /// A JavaScript action: its definition and directory.
+    Node(Box<ActionDef>, PathBuf),
     /// Recognized but not runnable yet — carries a reason to show the user.
     Unsupported(String),
 }
@@ -457,9 +459,7 @@ fn resolve_action(reference: &str, workspace: &Path) -> Result<ResolvedAction> {
     let def = parse::parse_action_file(&action_file)?;
     match &def.runs {
         Runs::Composite { .. } => Ok(ResolvedAction::Composite(Box::new(def), dir)),
-        Runs::Node { .. } => Ok(ResolvedAction::Unsupported(
-            "JavaScript action — the Node runtime arrives in a later milestone".to_string(),
-        )),
+        Runs::Node { .. } => Ok(ResolvedAction::Node(Box::new(def), dir)),
         Runs::Docker { .. } => Ok(ResolvedAction::Unsupported(
             "Docker action — support arrives in a later milestone".to_string(),
         )),
@@ -482,8 +482,9 @@ fn run_uses_step(
     println!(); // end the "… " header line
 
     let resolved = resolve_action(reference, &opts.workspace)?;
-    let (def, dir) = match resolved {
-        ResolvedAction::Composite(def, dir) => (def, dir),
+    let (def, dir, is_node) = match resolved {
+        ResolvedAction::Composite(def, dir) => (def, dir, false),
+        ResolvedAction::Node(def, dir) => (def, dir, true),
         ResolvedAction::Unsupported(reason) => {
             println!("  ⤼ step {number} skipped ({reason})");
             record_step(state, step, "skipped", "skipped", IndexMap::new());
@@ -491,15 +492,23 @@ fn run_uses_step(
         }
     };
 
-    // Resolve the inputs the composite sees: `with:` values over declared defaults.
+    // Resolve the inputs the action sees: `with:` values over declared defaults.
     let inputs = resolve_inputs(&def, with, ctx)?;
 
     let env_before = state.env.clone();
     let path_before = state.path.clone();
     let fs_before = diff::snapshot_fs(&opts.workspace, MAX_DIFF_FILES);
 
-    println!("  ┌ composite action `{reference}`");
-    let (outputs, ok) = run_composite(&def, &inputs, state, github, runner, opts, &dir)?;
+    let kind = if is_node { "javascript" } else { "composite" };
+    println!("  ┌ {kind} action `{reference}`");
+    let (outputs, ok) = if is_node {
+        let Runs::Node { main, .. } = &def.runs else {
+            unreachable!("resolved as Node")
+        };
+        run_node_action(main, &dir, &inputs, state, github, runner, opts)?
+    } else {
+        run_composite(&def, &inputs, state, github, runner, opts, &dir)?
+    };
     println!("  └ end `{reference}`");
 
     let fs_after = diff::snapshot_fs(&opts.workspace, MAX_DIFF_FILES);
@@ -525,6 +534,66 @@ fn run_uses_step(
     }
     print_diff(&env_delta, &fs_delta, &opts.secrets);
     Ok(Flow::Continue)
+}
+
+/// Run a JavaScript action: `node <dir>/<main>` with `INPUT_*` + the standard
+/// runner env and channel files, then read back its env/path/outputs. Uses the
+/// host's `node` (a later milestone can pin the version).
+#[allow(clippy::too_many_arguments)]
+fn run_node_action(
+    main: &str,
+    action_dir: &Path,
+    inputs: &IndexMap<String, String>,
+    state: &mut JobState,
+    github: &Value,
+    runner: &Value,
+    opts: &RunOptions,
+) -> Result<(IndexMap<String, String>, bool)> {
+    let entry = action_dir.join(main);
+    if !entry.exists() {
+        bail!("action entry point `{}` not found", entry.display());
+    }
+
+    let env_file = NamedTempFile::new().context("creating GITHUB_ENV file")?;
+    let out_file = NamedTempFile::new().context("creating GITHUB_OUTPUT file")?;
+    let path_file = NamedTempFile::new().context("creating GITHUB_PATH file")?;
+    let state_file = NamedTempFile::new().context("creating GITHUB_STATE file")?;
+    let summary_file = NamedTempFile::new().context("creating GITHUB_STEP_SUMMARY file")?;
+
+    let mut step_env = state.env.clone();
+    for (k, v) in input_env_vars(inputs) {
+        step_env.insert(k, v);
+    }
+
+    let mut cmd = Command::new("node");
+    cmd.arg(&entry).current_dir(&opts.workspace);
+    apply_common_env(
+        &mut cmd,
+        &step_env,
+        &state.path,
+        github,
+        runner,
+        &opts.workspace,
+    );
+    cmd.env("GITHUB_ENV", env_file.path());
+    cmd.env("GITHUB_OUTPUT", out_file.path());
+    cmd.env("GITHUB_PATH", path_file.path());
+    cmd.env("GITHUB_STATE", state_file.path());
+    cmd.env("GITHUB_STEP_SUMMARY", summary_file.path());
+    cmd.env("GITHUB_ACTION_PATH", action_dir);
+
+    let status = cmd
+        .status()
+        .map_err(|e| anyhow::anyhow!("failed to run `node` (is Node.js installed?): {e}"))?;
+
+    for (k, v) in read_key_values(env_file.path())? {
+        state.env.insert(k, v);
+    }
+    for p in read_path_additions(path_file.path())? {
+        state.path.insert(0, p);
+    }
+    let outputs: IndexMap<String, String> = read_key_values(out_file.path())?.into_iter().collect();
+    Ok((outputs, status.success()))
 }
 
 /// Compute the inputs a composite action sees: each declared input takes its

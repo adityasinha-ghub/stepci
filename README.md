@@ -160,6 +160,13 @@ the common functions. Deferred or approximate:
     a fixed tag) are unaffected.
 - **Native execution inherits your host environment** and runs on your host OS
   (`runs-on` is informational). Convenient, but not a hermetic Ubuntu runner.
+- **One shared workspace, no per-job isolation.** GitHub gives every job and
+  every matrix combination a fresh runner; stepci runs them **sequentially in the
+  same directory**, so filesystem changes persist between them. A file a `linux`
+  matrix run writes is still there for the `mac` run — so, e.g., an
+  `upload-artifact` of a build dir can pick up a previous combination's leftovers.
+  Have steps clean their output dirs if that matters (auto-cleaning isn't safe —
+  stepci can't tell your files from a job's).
 - **`matrix`** runs sequentially (`max-parallel` is ignored) with scalar values
   (objects as matrix values aren't supported). `include`/`exclude` follow
   GitHub's documented rules — includes match against the base product only, add

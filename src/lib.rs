@@ -9,6 +9,7 @@
 //! isolation.
 
 pub mod artifact;
+pub mod cache;
 pub mod diff;
 pub mod envfile;
 pub mod exec;

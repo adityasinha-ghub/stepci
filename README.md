@@ -93,11 +93,9 @@ actually would — no container in the way.
 **Explicitly deferred (the README says so until they land):**
 - Running a whole job inside a **`container:`** (steps would run via `docker
   exec` rather than natively — it cuts against the native wedge, so it's on hold).
-  A **real** local `actions/cache` (today it's a clean miss — see below).
 - macOS/Windows runner fidelity (steps run on your host OS; `runs-on` is
   informational).
-- JS `pre` hooks (`post` runs), `hashFiles()`, and the full `github.event`
-  payload.
+- JS `pre` hooks (`post` runs), and the full `github.event` payload.
 
 Native execution means we don't reimplement Docker, and steps run on your host
 rather than a hermetic Ubuntu image — convenient and fast, but some workflows
@@ -126,8 +124,9 @@ The `${{ }}` evaluator is faithful to the runner for operators, coercion,
 equality (case-insensitive strings; reference-inequality for arrays/objects), and
 the common functions. Deferred or approximate:
 
-- **Object filters** (`.*`) and **`hashFiles()`** are not implemented — they error
-  clearly rather than returning a wrong value.
+- **Object filters** (`.*`) are not implemented — they error clearly rather than
+  returning a wrong value. **`hashFiles()`** is implemented (SHA-256 over the
+  matched files, relative to the workspace).
 - **Number → string** formatting approximates GitHub's `G15`; it can differ for
   values with >15 significant digits or ones GitHub prints in exponent form
   (uncommon, since the language has no arithmetic).
@@ -185,11 +184,14 @@ the common functions. Deferred or approximate:
   offline, with no real upload. Common inputs (`name`, `path` incl. globs and
   directories, `if-no-files-found`, download `path`, name-less "download all")
   are handled; exclude (`!`) patterns, retention, and compression are not.
-- **`actions/cache`** (and `cache/restore`, `cache/save`) is treated as a clean
-  **miss** — it emits `cache-hit: false` (so `if:` guards run the real work) and
-  does nothing else. A local cache can't populate until `pre`/`post` hooks land
-  (GitHub saves the cache in a post-step), so a no-op is the honest behavior
-  rather than a half-working shim.
+- **`actions/cache`** (and `cache/restore`, `cache/save`) is backed by a **real
+  local store** under `~/.cache/stepci/cache`: it restores on a `key` hit
+  (setting `cache-hit: true`), falls back to `restore-keys` prefixes, and — for
+  `actions/cache` — saves the `path`s under the key in a post-step on a miss, so
+  the *next* run restores them. `path` handles directories, files, and `~/…`.
+  Keys usually use [`hashFiles()`](#known-expression-gaps-v0), which is
+  implemented. The store is keyed by the literal `key` string (no compression,
+  no size limits, no cross-machine sharing).
 - **Service containers** (`services:`) start via Docker before the job, with
   ports published to the host and `options:` (incl. quoted `--health-cmd`)
   passed through; stepci waits (up to ~15s) for each port to accept connections,
@@ -254,10 +256,11 @@ has no inline `#` comments — the whole value after `=` is the secret.
 - [ ] Artifacts & `actions/cache`; service containers
 - [x] Stdout `::workflow-commands::` (`set-output`, `add-mask`, annotations) with live stream masking
 - [x] Artifacts — `upload-artifact`/`download-artifact` via a run-local store (cross-job, offline)
-- [x] `actions/cache` — treated as a clean miss (`cache-hit: false`) until `pre`/`post` land
+- [x] `actions/cache` — real local store (`key` hit restores, `restore-keys`, post-save on miss)
+- [x] `hashFiles()` — SHA-256 over matched files, for cache keys and `if:`
 - [x] Service containers (`services:`) — start via Docker, host-published ports, readiness wait, auto-teardown
 - [x] JS action `post` hooks (reverse order, `$GITHUB_STATE` → `STATE_*` round-trip)
-- [ ] Fidelity/hardening (JS `pre`, `hashFiles`, real-workflow testing)
+- [ ] Fidelity/hardening (JS `pre`, `container:` jobs, real-workflow testing)
 - [ ] Session recording → replayable script; **publish**
 
 ## Install

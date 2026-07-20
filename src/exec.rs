@@ -19,6 +19,7 @@ use tempfile::NamedTempFile;
 use walkdir::WalkDir;
 
 use crate::artifact;
+use crate::cache;
 use crate::diff::{self, Entry, EnvDiff, FsDiff};
 use crate::envfile;
 use crate::expr::{self, Context, JobStatus};
@@ -327,9 +328,27 @@ struct JobState {
     matrix: IndexMap<String, Value>,
     /// Running job status, which drives `if:` and the status functions.
     status: JobStatus,
-    /// `post` cleanup scripts registered by JS actions whose main ran, executed
-    /// in reverse order after the job's steps.
-    post: Vec<NodePost>,
+    /// Cleanup work registered during the job (JS `post` scripts, cache saves),
+    /// executed in reverse order after the job's steps.
+    post: Vec<PostAction>,
+}
+
+/// Work registered during a job to run after its steps, in reverse (LIFO) order.
+enum PostAction {
+    /// A JavaScript action's `post` entry point.
+    Node(Box<NodePost>),
+    /// Save paths into the local cache under a key (an `actions/cache` miss).
+    CacheSave(CacheSaveData),
+}
+
+/// A pending cache save: the key and the raw `path` entries to store.
+struct CacheSaveData {
+    /// The action reference, for display.
+    label: String,
+    /// The primary cache key to store under.
+    key: String,
+    /// The raw `path:` entries (resolved against the workspace at save time).
+    paths: Vec<String>,
 }
 
 /// The result of running a JavaScript action's main entry point.
@@ -674,11 +693,10 @@ fn run_uses_step(
     if let Some(art) = artifact::kind(reference) {
         return run_artifact_shim(step, number, state, opts, reference, with, ctx, art);
     }
-    // `actions/cache` saves in a post-step we don't run, so a local cache could
-    // never populate — treat it as a clean miss instead of letting the real
-    // action fail against the absent cache service.
+    // `actions/cache` is backed by a local store (restore on a key hit; save via
+    // a post action on a miss) rather than the hosted cache service.
     if is_cache_action(reference) {
-        return run_cache_noop(step, number, state, reference);
+        return run_cache_action(step, number, state, opts, reference, with, ctx);
     }
 
     #[derive(Clone, Copy)]
@@ -722,14 +740,14 @@ fn run_uses_step(
             // A `post` script runs after the job's steps (LIFO), with the state
             // the main just saved exposed to it as `STATE_<name>`.
             if let Some(post_script) = post {
-                state.post.push(NodePost {
+                state.post.push(PostAction::Node(Box::new(NodePost {
                     label: reference.to_string(),
                     dir: dir.clone(),
                     script: post_script.clone(),
                     base_env: step_env.clone(),
                     inputs: inputs.clone(),
                     state: run.saved_state,
-                });
+                })));
             }
             (run.outputs, run.ok)
         }
@@ -831,21 +849,265 @@ fn is_cache_action(reference: &str) -> bool {
     )
 }
 
-/// Treat an `actions/cache` step as a clean miss: report it, emit
-/// `cache-hit: false` so downstream `if:` guards run the real work, and move on.
-fn run_cache_noop(
+/// Which `actions/cache` variant a reference names.
+#[derive(Clone, Copy, PartialEq)]
+enum CacheVariant {
+    /// `actions/cache`: restore in main, save (on a miss) after the job.
+    Cache,
+    /// `actions/cache/restore`: restore only.
+    Restore,
+    /// `actions/cache/save`: save immediately.
+    Save,
+}
+
+fn cache_variant(reference: &str) -> CacheVariant {
+    match reference.split('@').next().unwrap_or(reference) {
+        "actions/cache/restore" => CacheVariant::Restore,
+        "actions/cache/save" => CacheVariant::Save,
+        _ => CacheVariant::Cache,
+    }
+}
+
+/// The result of a cache restore attempt.
+enum RestoreOutcome {
+    /// The primary key matched exactly.
+    Exact,
+    /// A `restore-keys` prefix matched this (different) key.
+    Partial(String),
+    /// Nothing matched.
+    Miss,
+}
+
+/// Back an `actions/cache` step with the local store: restore on a key hit, and
+/// (for `actions/cache`) register a post save on a miss. Wrapped in the usual
+/// diff/record framing so restored files show in the step diff.
+#[allow(clippy::too_many_arguments)]
+fn run_cache_action(
     step: &Step,
     number: usize,
     state: &mut JobState,
+    opts: &RunOptions,
     reference: &str,
+    with: &IndexMap<String, String>,
+    ctx: &Context,
 ) -> Result<Flow> {
-    println!("  ┌ `{reference}` (cache isn't backed locally — treated as a miss)");
+    let variant = cache_variant(reference);
+    let key = shim_input(with, ctx, "key")?
+        .ok_or_else(|| anyhow::anyhow!("`{reference}` requires a `key` input"))?;
+    let paths: Vec<String> = shim_input(with, ctx, "path")?
+        .unwrap_or_default()
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(String::from)
+        .collect();
+    let restore_keys: Vec<String> = shim_input(with, ctx, "restore-keys")?
+        .unwrap_or_default()
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(String::from)
+        .collect();
+
+    let env_before = state.env.clone();
+    let path_before = state.path.clone();
+    let fs_before = diff::snapshot_fs(&opts.workspace, MAX_DIFF_FILES);
+
+    println!("  ┌ `{reference}` (local cache shim)");
+    let mut outputs: IndexMap<String, String> = IndexMap::new();
+    let result: Result<()> = (|| {
+        if variant == CacheVariant::Save {
+            if paths.is_empty() {
+                bail!("cache/save requires a `path` input");
+            }
+            let n = cache_do_save(&key, &paths, &opts.workspace)?;
+            println!("  │ saved {n} file(s) to cache `{key}`");
+            return Ok(());
+        }
+
+        outputs.insert("cache-primary-key".to_string(), key.clone());
+        match cache_do_restore(&key, &restore_keys, &opts.workspace)? {
+            RestoreOutcome::Exact => {
+                println!("  │ cache hit — restored `{key}`");
+                outputs.insert("cache-hit".to_string(), "true".to_string());
+                outputs.insert("cache-matched-key".to_string(), key.clone());
+            }
+            RestoreOutcome::Partial(matched) => {
+                println!("  │ partial hit — restored `{matched}` via restore-keys");
+                outputs.insert("cache-hit".to_string(), "false".to_string());
+                outputs.insert("cache-matched-key".to_string(), matched);
+            }
+            RestoreOutcome::Miss => {
+                println!("  │ cache miss for `{key}`");
+                outputs.insert("cache-hit".to_string(), "false".to_string());
+            }
+        }
+        // `actions/cache` saves the paths under the primary key after the job,
+        // but only when the exact key wasn't already present.
+        if variant == CacheVariant::Cache
+            && outputs.get("cache-hit").map(String::as_str) != Some("true")
+        {
+            if paths.is_empty() {
+                bail!("cache requires a `path` input");
+            }
+            state.post.push(PostAction::CacheSave(CacheSaveData {
+                label: reference.to_string(),
+                key: key.clone(),
+                paths: paths.clone(),
+            }));
+        }
+        Ok(())
+    })();
+
+    let ok = match &result {
+        Ok(()) => true,
+        Err(e) => {
+            println!("  │ error: {e:#}");
+            false
+        }
+    };
     println!("  └ end `{reference}`");
-    let mut outputs = IndexMap::new();
-    outputs.insert("cache-hit".to_string(), "false".to_string());
-    record_step(state, step, "success", "success", outputs);
-    println!("  ✓ step {number} ok");
+
+    let fs_after = diff::snapshot_fs(&opts.workspace, MAX_DIFF_FILES);
+    let env_delta = diff::env_diff(&env_before, &state.env, &path_before, &state.path);
+    let fs_delta = diff::fs_diff(&fs_before, &fs_after);
+
+    let (outcome, conclusion) = if ok {
+        ("success", "success")
+    } else if step_continues_on_error(step, ctx)? {
+        ("failure", "success")
+    } else {
+        ("failure", "failure")
+    };
+    if conclusion == "failure" {
+        state.status = JobStatus::Failure;
+    }
+    record_step(state, step, outcome, conclusion, outputs);
+    match (ok, conclusion) {
+        (true, _) => println!("  ✓ step {number} ok"),
+        (false, "success") => println!("  ⚠ step {number} failed — continue-on-error"),
+        (false, _) => println!("  ✗ step {number} failed"),
+    }
+    print_diff(&env_delta, &fs_delta, &opts.secrets);
     Ok(Flow::Continue)
+}
+
+/// Save each `path` root into the cache under `key`. Files are stored relative
+/// to each root's parent, so restore can drop them back in place.
+fn cache_do_save(key: &str, paths: &[String], workspace: &Path) -> Result<usize> {
+    let dir = cache::entry_dir(&cache::cache_root()?, key);
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir).context("clearing prior cache entry")?;
+    }
+    std::fs::create_dir_all(dir.join("data")).context("creating cache entry")?;
+    std::fs::write(dir.join("key"), key).context("writing cache key marker")?;
+
+    let mut manifest = String::new();
+    let mut count = 0usize;
+    let mut idx = 0usize;
+    for entry in paths {
+        let root = cache::resolve_path(entry, workspace);
+        let Some(base) = root.parent() else { continue };
+        if !root.exists() {
+            println!("  │ (skipping missing cache path {})", root.display());
+            continue;
+        }
+        let data_dir = dir.join("data").join(idx.to_string());
+        for f in WalkDir::new(&root).into_iter().filter_map(Result::ok) {
+            if f.file_type().is_file() {
+                let rel = f.path().strip_prefix(base).unwrap_or(f.path());
+                let target = data_dir.join(rel);
+                if let Some(p) = target.parent() {
+                    std::fs::create_dir_all(p).context("creating cache directory")?;
+                }
+                std::fs::copy(f.path(), &target)
+                    .with_context(|| format!("caching `{}`", f.path().display()))?;
+                count += 1;
+            }
+        }
+        // Record the base relative to the workspace when it's inside it, so the
+        // cache restores correctly even if the repo lives at a different path
+        // on a later run; otherwise record the absolute path (e.g. `~/.cargo`).
+        match base.strip_prefix(workspace) {
+            Ok(rel) => manifest.push_str(&format!("W\t{}\n", rel.display())),
+            Err(_) => manifest.push_str(&format!("A\t{}\n", base.display())),
+        }
+        idx += 1;
+    }
+    std::fs::write(dir.join("manifest"), manifest).context("writing cache manifest")?;
+    Ok(count)
+}
+
+/// Restore the exact key if present, else the most recent entry matching a
+/// `restore-keys` prefix, else nothing.
+fn cache_do_restore(
+    key: &str,
+    restore_keys: &[String],
+    workspace: &Path,
+) -> Result<RestoreOutcome> {
+    let root = cache::cache_root()?;
+    let exact = cache::entry_dir(&root, key);
+    if exact.join("manifest").exists() {
+        cache_restore_from(&exact, workspace)?;
+        return Ok(RestoreOutcome::Exact);
+    }
+    for prefix in restore_keys {
+        if let Some((matched_key, dir)) = cache_find_by_prefix(&root, prefix)? {
+            cache_restore_from(&dir, workspace)?;
+            return Ok(RestoreOutcome::Partial(matched_key));
+        }
+    }
+    Ok(RestoreOutcome::Miss)
+}
+
+/// Copy a cache entry's stored files back to the roots recorded in its manifest.
+/// A `W\t<rel>` line restores relative to the current workspace; `A\t<abs>` is
+/// an absolute base (e.g. a home-directory cache).
+fn cache_restore_from(dir: &Path, workspace: &Path) -> Result<()> {
+    let manifest = std::fs::read_to_string(dir.join("manifest")).unwrap_or_default();
+    let mut count = 0usize;
+    for (i, line) in manifest.lines().enumerate() {
+        let base = if let Some(rel) = line.strip_prefix("W\t") {
+            workspace.join(rel)
+        } else if let Some(abs) = line.strip_prefix("A\t") {
+            PathBuf::from(abs)
+        } else {
+            PathBuf::from(line) // tolerate an older/plain line
+        };
+        let data_dir = dir.join("data").join(i.to_string());
+        if data_dir.is_dir() {
+            copy_tree(&data_dir, &base, &mut count)?;
+        }
+    }
+    Ok(())
+}
+
+/// Find the most recently written cache entry whose key starts with `prefix`.
+fn cache_find_by_prefix(root: &Path, prefix: &str) -> Result<Option<(String, PathBuf)>> {
+    if !root.is_dir() {
+        return Ok(None);
+    }
+    let mut best: Option<(std::time::SystemTime, String, PathBuf)> = None;
+    for entry in std::fs::read_dir(root).context("reading cache store")? {
+        let dir = entry?.path();
+        if !dir.join("manifest").exists() {
+            continue;
+        }
+        let Ok(k) = std::fs::read_to_string(dir.join("key")) else {
+            continue;
+        };
+        let k = k.trim().to_string();
+        if !k.starts_with(prefix) {
+            continue;
+        }
+        let mtime = std::fs::metadata(&dir)
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::UNIX_EPOCH);
+        if best.as_ref().is_none_or(|(t, _, _)| mtime >= *t) {
+            best = Some((mtime, k, dir));
+        }
+    }
+    Ok(best.map(|(_, k, d)| (k, d)))
 }
 
 /// Read a `with:` input for a shim, interpolating `${{ }}` if present.
@@ -1100,9 +1362,20 @@ fn run_post_actions(state: &mut JobState, github: &Value, runner: &Value, opts: 
     let posts = std::mem::take(&mut state.post);
     let path = state.path.clone();
     for p in posts.into_iter().rev() {
-        println!("\n  ↺ post: {}", p.label);
-        if let Err(e) = run_node_post(&p, &path, github, runner, opts) {
-            println!("  ⚠ post `{}` errored: {e:#}", p.label);
+        match p {
+            PostAction::Node(np) => {
+                println!("\n  ↺ post: {}", np.label);
+                if let Err(e) = run_node_post(&np, &path, github, runner, opts) {
+                    println!("  ⚠ post `{}` errored: {e:#}", np.label);
+                }
+            }
+            PostAction::CacheSave(cs) => {
+                println!("\n  ↺ post: {} (cache save)", cs.label);
+                match cache_do_save(&cs.key, &cs.paths, &opts.workspace) {
+                    Ok(n) => println!("  saved {n} file(s) to cache `{}`", cs.key),
+                    Err(e) => println!("  ⚠ cache save `{}` errored: {e:#}", cs.key),
+                }
+            }
         }
     }
 }

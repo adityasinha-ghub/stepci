@@ -327,6 +327,36 @@ struct JobState {
     matrix: IndexMap<String, Value>,
     /// Running job status, which drives `if:` and the status functions.
     status: JobStatus,
+    /// `post` cleanup scripts registered by JS actions whose main ran, executed
+    /// in reverse order after the job's steps.
+    post: Vec<NodePost>,
+}
+
+/// The result of running a JavaScript action's main entry point.
+struct NodeRun {
+    /// Outputs (`$GITHUB_OUTPUT` file plus stdout `set-output`).
+    outputs: IndexMap<String, String>,
+    /// Whether the process exited successfully.
+    ok: bool,
+    /// State the action saved (`core.saveState`) for its own `post` script.
+    saved_state: IndexMap<String, String>,
+}
+
+/// A JavaScript action's `post` script, captured when its main runs so it can be
+/// run after the job's steps (with the state the main saved via `$GITHUB_STATE`).
+struct NodePost {
+    /// The action reference, for display.
+    label: String,
+    /// The action's directory (its `GITHUB_ACTION_PATH`).
+    dir: PathBuf,
+    /// The `runs.post` entry script.
+    script: String,
+    /// The job+step env as of the main run.
+    base_env: IndexMap<String, String>,
+    /// The action's resolved inputs (exposed again as `INPUT_*`).
+    inputs: IndexMap<String, String>,
+    /// State the main saved, exposed to the post as `STATE_<name>`.
+    state: IndexMap<String, String>,
 }
 
 fn run_job(
@@ -344,6 +374,7 @@ fn run_job(
         steps: IndexMap::new(),
         matrix: matrix.clone(),
         status: JobStatus::Success,
+        post: Vec::new(),
     };
 
     // Layer workflow then job env, interpolating each value as it's added so it
@@ -373,6 +404,7 @@ fn run_job(
         start_services(job, &ctx)?
     };
 
+    let mut flow_out = Flow::Continue;
     for (i, step) in job.steps.iter().enumerate() {
         let flow = run_step(
             step,
@@ -387,11 +419,18 @@ fn run_job(
         )
         .with_context(|| format!("in step {}", i + 1))?;
         if flow == Flow::Quit {
-            return Ok((state.status, Flow::Quit));
+            flow_out = Flow::Quit;
+            break;
         }
     }
 
-    Ok((state.status, Flow::Continue))
+    // Run registered `post` cleanup in reverse order — unless the user quit, in
+    // which case we honor the bail-out and skip it.
+    if flow_out != Flow::Quit {
+        run_post_actions(&mut state, github, runner, opts);
+    }
+
+    Ok((state.status, flow_out))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -676,10 +715,23 @@ fn run_uses_step(
     let (outputs, ok) = match kind {
         Kind::Composite => run_composite(&def, &inputs, state, github, runner, opts, &dir)?,
         Kind::Node => {
-            let Runs::Node { main, .. } = &def.runs else {
+            let Runs::Node { main, post, .. } = &def.runs else {
                 unreachable!("resolved as Node")
             };
-            run_node_action(main, &dir, &inputs, step_env, state, github, runner, opts)?
+            let run = run_node_action(main, &dir, &inputs, step_env, state, github, runner, opts)?;
+            // A `post` script runs after the job's steps (LIFO), with the state
+            // the main just saved exposed to it as `STATE_<name>`.
+            if let Some(post_script) = post {
+                state.post.push(NodePost {
+                    label: reference.to_string(),
+                    dir: dir.clone(),
+                    script: post_script.clone(),
+                    base_env: step_env.clone(),
+                    inputs: inputs.clone(),
+                    state: run.saved_state,
+                });
+            }
+            (run.outputs, run.ok)
         }
         Kind::Docker => {
             run_docker_action(&def, &dir, &inputs, step_env, state, github, runner, opts)?
@@ -980,7 +1032,7 @@ fn run_node_action(
     github: &Value,
     runner: &Value,
     opts: &RunOptions,
-) -> Result<(IndexMap<String, String>, bool)> {
+) -> Result<NodeRun> {
     let entry = action_dir.join(main);
     if !entry.exists() {
         bail!("action entry point `{}` not found", entry.display());
@@ -1029,7 +1081,76 @@ fn run_node_action(
     for (k, v) in scan.outputs {
         outputs.insert(k, v);
     }
-    Ok((outputs, status.success()))
+    // State the action saved (via `core.saveState`) for its own `post` script.
+    let saved_state: IndexMap<String, String> =
+        read_key_values(state_file.path())?.into_iter().collect();
+    Ok(NodeRun {
+        outputs,
+        ok: status.success(),
+        saved_state,
+    })
+}
+
+/// Run each registered `post` script in reverse (LIFO) order after the job's
+/// steps. Best-effort: a post failure warns but doesn't fail the job.
+fn run_post_actions(state: &mut JobState, github: &Value, runner: &Value, opts: &RunOptions) {
+    if state.post.is_empty() {
+        return;
+    }
+    let posts = std::mem::take(&mut state.post);
+    let path = state.path.clone();
+    for p in posts.into_iter().rev() {
+        println!("\n  ↺ post: {}", p.label);
+        if let Err(e) = run_node_post(&p, &path, github, runner, opts) {
+            println!("  ⚠ post `{}` errored: {e:#}", p.label);
+        }
+    }
+}
+
+/// Run one JS action `post` script: `node <dir>/<post>` with the action's
+/// `INPUT_*` and the `STATE_<name>` values its main saved.
+fn run_node_post(
+    post: &NodePost,
+    path: &[String],
+    github: &Value,
+    runner: &Value,
+    opts: &RunOptions,
+) -> Result<()> {
+    let entry = post.dir.join(&post.script);
+    if !entry.exists() {
+        return Ok(()); // nothing to run
+    }
+
+    let env_file = NamedTempFile::new().context("creating GITHUB_ENV file")?;
+    let out_file = NamedTempFile::new().context("creating GITHUB_OUTPUT file")?;
+    let path_file = NamedTempFile::new().context("creating GITHUB_PATH file")?;
+    let state_file = NamedTempFile::new().context("creating GITHUB_STATE file")?;
+    let summary_file = NamedTempFile::new().context("creating GITHUB_STEP_SUMMARY file")?;
+
+    let mut env = post.base_env.clone();
+    for (k, v) in input_env_vars(&post.inputs) {
+        env.insert(k, v);
+    }
+    for (k, v) in &post.state {
+        env.insert(format!("STATE_{k}"), v.clone());
+    }
+
+    let mut cmd = Command::new("node");
+    cmd.arg(&entry).current_dir(&opts.workspace);
+    apply_common_env(&mut cmd, &env, path, github, runner, &opts.workspace);
+    cmd.env("GITHUB_ENV", env_file.path());
+    cmd.env("GITHUB_OUTPUT", out_file.path());
+    cmd.env("GITHUB_PATH", path_file.path());
+    cmd.env("GITHUB_STATE", state_file.path());
+    cmd.env("GITHUB_STEP_SUMMARY", summary_file.path());
+    cmd.env("GITHUB_ACTION_PATH", &post.dir);
+
+    let (status, _scan) = run_capturing(cmd, &opts.secrets)
+        .map_err(|e| anyhow::anyhow!("running post `node`: {e:#}"))?;
+    if !status.success() {
+        println!("  ⚠ post script exited {}", status.code().unwrap_or(-1));
+    }
+    Ok(())
 }
 
 /// Run a Docker action: build (if a `Dockerfile`) or use a prebuilt image, then

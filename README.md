@@ -96,7 +96,8 @@ actually would — no container in the way.
   A **real** local `actions/cache` (today it's a clean miss — see below).
 - macOS/Windows runner fidelity (steps run on your host OS; `runs-on` is
   informational).
-- JS `pre`/`post` hooks, `hashFiles()`, and the full `github.event` payload.
+- JS `pre` hooks (`post` runs), `hashFiles()`, and the full `github.event`
+  payload.
 
 Native execution means we don't reimplement Docker, and steps run on your host
 rather than a hermetic Ubuntu image — convenient and fast, but some workflows
@@ -144,9 +145,14 @@ the common functions. Deferred or approximate:
     Both the file channels (`$GITHUB_OUTPUT`/`$GITHUB_ENV`/`$GITHUB_PATH`) **and**
     stdout `::workflow-commands::` are handled — `set-output` (incl. the legacy
     form), `add-mask`, and `error`/`warning`/`notice`/`group`/`debug` annotations.
-    `pre`/`post` hooks aren't run yet, the deprecated stdout `set-env`/`add-path`
-    are ignored (use the file channels), and actions needing a real token/full
-    event payload (e.g. `checkout` on a private repo) may not fully succeed.
+    A JS action's **`post`** script runs after the job's steps in reverse (LIFO)
+    order, with the state its main saved (`core.saveState`) exposed as
+    `STATE_<name>` — so cleanup and cache-save work. `pre` hooks aren't run yet
+    (they'd run before the first step; rare in practice). The deprecated stdout
+    `set-env`/`add-path` are ignored (use the file channels), and actions needing
+    a real token/full event payload (e.g. `checkout` on a private repo) may not
+    fully succeed. A `post` script only runs if the action's main ran (a skipped
+    or quit-past step registers no cleanup).
   - **Docker** actions are the *only* place Docker is used: `docker://image` and
     `Dockerfile` builds, workspace mounted at `/github/workspace`, with channel
     writeback. Containers run as root (host files they create are root-owned);
@@ -250,7 +256,8 @@ has no inline `#` comments — the whole value after `=` is the secret.
 - [x] Artifacts — `upload-artifact`/`download-artifact` via a run-local store (cross-job, offline)
 - [x] `actions/cache` — treated as a clean miss (`cache-hit: false`) until `pre`/`post` land
 - [x] Service containers (`services:`) — start via Docker, host-published ports, readiness wait, auto-teardown
-- [ ] Fidelity/hardening (JS `pre`/`post`, `hashFiles`, real-workflow testing)
+- [x] JS action `post` hooks (reverse order, `$GITHUB_STATE` → `STATE_*` round-trip)
+- [ ] Fidelity/hardening (JS `pre`, `hashFiles`, real-workflow testing)
 - [ ] Session recording → replayable script; **publish**
 
 ## Install

@@ -699,7 +699,22 @@ fn call(name: &str, args: &[Ast], ctx: &Context) -> Result<Value> {
             check_args(name, &vals, 0)?;
             Ok(Value::Bool(true))
         }
-        "hashfiles" => bail!("hashFiles() is not supported yet (arrives with the executor)"),
+        "hashfiles" => {
+            if vals.is_empty() {
+                bail!("hashFiles expects at least one path pattern");
+            }
+            let workspace = ctx
+                .vars
+                .get("github")
+                .and_then(|g| match g {
+                    Value::Object(m) => m.get("workspace"),
+                    _ => None,
+                })
+                .map(Value::to_display_string)
+                .unwrap_or_else(|| ".".to_string());
+            let patterns: Vec<String> = vals.iter().map(Value::to_display_string).collect();
+            hash_files(&workspace, &patterns)
+        }
         _ => bail!("unknown function `{name}`"),
     }
 }
@@ -709,6 +724,50 @@ fn check_args(name: &str, vals: &[Value], expected: usize) -> Result<()> {
         bail!("{name} expects {expected} argument(s), got {}", vals.len());
     }
     Ok(())
+}
+
+/// `hashFiles(pattern, …)` — match files under the workspace (globs, `**`
+/// supported), and return the hex SHA-256 of the concatenated per-file SHA-256
+/// digests, in sorted path order. Empty string when nothing matches, exactly
+/// like the runner.
+fn hash_files(workspace: &str, patterns: &[String]) -> Result<Value> {
+    use sha2::{Digest, Sha256};
+    use std::path::PathBuf;
+
+    let mut matched: Vec<PathBuf> = Vec::new();
+    for pat in patterns {
+        // Patterns are relative to the workspace (an absolute pattern would
+        // escape it — join keeps it scoped).
+        let full = format!("{}/{}", workspace.trim_end_matches('/'), pat);
+        let entries = glob::glob(&full)
+            .map_err(|e| anyhow::anyhow!("hashFiles: bad pattern `{pat}`: {e}"))?;
+        for entry in entries {
+            let p = entry.map_err(|e| anyhow::anyhow!("hashFiles: matching `{pat}`: {e}"))?;
+            if p.is_file() {
+                matched.push(p);
+            }
+        }
+    }
+    matched.sort();
+    matched.dedup();
+    if matched.is_empty() {
+        return Ok(Value::Str(String::new()));
+    }
+
+    let mut outer = Sha256::new();
+    for f in &matched {
+        let bytes = std::fs::read(f)
+            .map_err(|e| anyhow::anyhow!("hashFiles: reading `{}`: {e}", f.display()))?;
+        let mut inner = Sha256::new();
+        inner.update(&bytes);
+        outer.update(inner.finalize());
+    }
+    let hex: String = outer
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    Ok(Value::Str(hex))
 }
 
 fn contains(haystack: &Value, needle: &Value) -> bool {
@@ -834,11 +893,11 @@ mod tests {
         assert_eq!(ev("'set' || 'fallback'"), Value::Str("set".to_string()));
         // `&&` yields the last operand when the first is truthy.
         assert_eq!(ev("true && 'yes'"), Value::Str("yes".to_string()));
-        // Short-circuit must NOT evaluate the RHS: `hashFiles` errors if reached,
-        // so these only succeed because the RHS is skipped.
-        assert_eq!(ev("false && hashFiles('x')"), Value::Bool(false));
+        // Short-circuit must NOT evaluate the RHS: `fromJSON('{')` errors if
+        // reached, so these only succeed because the RHS is skipped.
+        assert_eq!(ev("false && fromJSON('{')"), Value::Bool(false));
         assert_eq!(
-            ev("'keep' || hashFiles('x')"),
+            ev("'keep' || fromJSON('{')"),
             Value::Str("keep".to_string())
         );
     }
@@ -959,13 +1018,42 @@ mod tests {
             format!("{:#}", evaluate("bogus(1)", &ctx()).unwrap_err()).contains("unknown function")
         );
         assert!(
-            format!("{:#}", evaluate("hashFiles('*')", &ctx()).unwrap_err())
-                .contains("not supported")
-        );
-        assert!(
             format!("{:#}", evaluate("1 +", &ctx()).unwrap_err()).contains("unexpected character")
         );
         assert!(format!("{:#}", evaluate("(1 == 1", &ctx()).unwrap_err()).contains("expected `)`"));
         assert!(interpolate("${{ 1 == 1", &ctx()).is_err());
+    }
+
+    #[test]
+    fn hash_files_hashes_matched_files() {
+        use sha2::{Digest, Sha256};
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"hello").unwrap();
+
+        let mut github = IndexMap::new();
+        github.insert(
+            "workspace".to_string(),
+            Value::Str(dir.path().to_string_lossy().into_owned()),
+        );
+        let mut vars = IndexMap::new();
+        vars.insert("github".to_string(), Value::Object(github));
+        let c = Context::new(vars);
+
+        // Exactly the runner's algorithm: hex SHA-256 of each file's SHA-256.
+        let h1 = evaluate("hashFiles('*.txt')", &c).unwrap();
+        let expected: String = Sha256::digest(Sha256::digest(b"hello"))
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(h1, Value::Str(expected));
+
+        // Deterministic; no match → empty string; content changes the hash.
+        assert_eq!(evaluate("hashFiles('*.txt')", &c).unwrap(), h1);
+        assert_eq!(
+            evaluate("hashFiles('*.none')", &c).unwrap(),
+            Value::Str(String::new())
+        );
+        std::fs::write(dir.path().join("a.txt"), b"world").unwrap();
+        assert_ne!(evaluate("hashFiles('*.txt')", &c).unwrap(), h1);
     }
 }

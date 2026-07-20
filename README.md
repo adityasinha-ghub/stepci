@@ -269,7 +269,21 @@ has no inline `#` comments — the whole value after `=` is the secret.
 
 ## Install
 
-Not published yet. To build from source:
+**Prebuilt binary** (macOS arm64/x64, Linux x64) — from the latest release:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/adityasinha-ghub/stepci/main/install.sh | sh
+```
+
+It installs to `~/.local/bin` by default (override with `STEPCI_BIN_DIR`).
+
+**With Cargo** (any platform with a Rust toolchain):
+
+```bash
+cargo install --git https://github.com/adityasinha-ghub/stepci
+```
+
+**From source:**
 
 ```bash
 git clone https://github.com/adityasinha-ghub/stepci

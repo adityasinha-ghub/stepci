@@ -17,7 +17,7 @@
 on your own machine, see exactly what each step changed, using your real secrets.**
 
 <p align="center">
-  <img src="docs/demo.gif" alt="stepci running a workflow and showing a per-step env + filesystem diff" width="760">
+  <img src="docs/demo.gif" alt="stepci stepping through a workflow: pausing before a step, dropping into a shell with the step's live env, showing a per-step diff, and masking a secret" width="820">
 </p>
 
 You edit a workflow, push, wait for CI, read the log, guess, and push again.

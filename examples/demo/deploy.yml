@@ -1,0 +1,16 @@
+name: deploy
+env:
+  REGION: us-east-1
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Build
+        run: |
+          mkdir -p dist
+          echo "app v1.4.2" > dist/app
+          echo "ENDPOINT=api.$REGION.example.com" >> "$GITHUB_ENV"
+      - name: Deploy
+        run: |
+          echo "Deploying to $ENDPOINT"
+          echo "auth token: ${{ secrets.DEPLOY_TOKEN }}"

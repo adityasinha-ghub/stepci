@@ -1,0 +1,19 @@
+name: demo
+env:
+  APP: stepci
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Compile
+        run: |
+          mkdir -p build
+          echo "binary contents" > build/app
+          echo "sourcemap"       > build/app.map
+      - name: Set version and extend PATH
+        run: |
+          echo "VERSION=1.4.2"      >> "$GITHUB_ENV"
+          echo "/opt/toolchain/bin" >> "$GITHUB_PATH"
+      - name: Patch the build
+        run: |
+          echo "hotfix" >> build/app

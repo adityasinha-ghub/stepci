@@ -16,6 +16,10 @@
 **A native, Dockerless debugger for GitHub Actions — step through a workflow run
 on your own machine, see exactly what each step changed, using your real secrets.**
 
+<p align="center">
+  <img src="docs/demo.gif" alt="stepci running a workflow and showing a per-step env + filesystem diff" width="760">
+</p>
+
 You edit a workflow, push, wait for CI, read the log, guess, and push again.
 Twelve "fix CI" commits later it goes green. `stepci` collapses that loop: run
 the workflow locally, pause between steps, and inspect *what actually happened*.

@@ -44,13 +44,19 @@ impl Context {
     }
 }
 
-/// Evaluate a single expression (the text inside `${{ }}`) to a [`Value`].
-pub fn evaluate(src: &str, ctx: &Context) -> Result<Value> {
+/// Lex and parse an expression into its AST (shared by the evaluator, the
+/// status-function check, and the condition explainer).
+fn parse_ast(src: &str) -> Result<Ast> {
     let tokens = lex(src)?;
     let mut parser = Parser::new(tokens);
     let ast = parser.parse_expr()?;
     parser.expect_eof()?;
-    eval(&ast, ctx)
+    Ok(ast)
+}
+
+/// Evaluate a single expression (the text inside `${{ }}`) to a [`Value`].
+pub fn evaluate(src: &str, ctx: &Context) -> Result<Value> {
+    eval(&parse_ast(src)?, ctx)
 }
 
 /// Whether an expression *calls* a status function (`success`/`failure`/
@@ -60,11 +66,150 @@ pub fn evaluate(src: &str, ctx: &Context) -> Result<Value> {
 /// name like `steps.success.outputs` is correctly *not* counted — unlike a
 /// substring scan.
 pub fn references_status_function(src: &str) -> Result<bool> {
-    let tokens = lex(src)?;
-    let mut parser = Parser::new(tokens);
-    let ast = parser.parse_expr()?;
-    parser.expect_eof()?;
-    Ok(ast_calls_status(&ast))
+    Ok(ast_calls_status(&parse_ast(src)?))
+}
+
+/// One operand of an `if:` condition's top-level `&&`/`||` chain, for explaining
+/// why a step ran or was skipped.
+#[derive(Debug, Clone)]
+pub struct Operand {
+    /// The operand rendered back to readable text.
+    pub text: String,
+    /// Its evaluated value — `None` if short-circuit meant it never ran.
+    pub value: Option<Value>,
+    /// Whether this operand decided the chain's result (the first falsy in an
+    /// `&&` chain, or the first truthy in an `||` chain).
+    pub decisive: bool,
+    /// For an evaluated comparison operand, its sides resolved:
+    /// `(left_text, left_value, right_text, right_value)`.
+    pub sides: Option<(String, Value, String, Value)>,
+}
+
+/// A condition broken into its top-level `&&`/`||` operands, each evaluated in
+/// real short-circuit order — so an explanation never claims to have evaluated an
+/// operand the runner would have short-circuited past.
+#[derive(Debug, Clone)]
+pub struct CondBreakdown {
+    /// The condition's overall value.
+    pub value: Value,
+    /// `true` for an `&&` chain (every operand must hold), `false` for `||`.
+    pub all_required: bool,
+    /// The operands, in source order.
+    pub operands: Vec<Operand>,
+}
+
+/// Break a condition into its top-level `&&`/`||` operands and evaluate them in
+/// short-circuit order, for explaining a true/false `if:`.
+pub fn explain_condition(src: &str, ctx: &Context) -> Result<CondBreakdown> {
+    let ast = parse_ast(src)?;
+    let value = eval(&ast, ctx)?;
+    let (all_required, parts) = match &ast {
+        Ast::Binary(BinOp::And, _, _) => (true, flatten_chain(&ast, &BinOp::And)),
+        Ast::Binary(BinOp::Or, _, _) => (false, flatten_chain(&ast, &BinOp::Or)),
+        // Not a boolean chain: the whole expression is its single operand.
+        _ => {
+            return Ok(CondBreakdown {
+                value: value.clone(),
+                all_required: true,
+                operands: vec![Operand {
+                    text: render(&ast),
+                    sides: comparison_sides(&ast, ctx)?,
+                    value: Some(value),
+                    decisive: true,
+                }],
+            });
+        }
+    };
+    let mut operands = Vec::with_capacity(parts.len());
+    let mut decided = false;
+    for part in parts {
+        if decided {
+            operands.push(Operand {
+                text: render(part),
+                value: None,
+                decisive: false,
+                sides: None,
+            });
+            continue;
+        }
+        let v = eval(part, ctx)?;
+        // `&&` stops at the first falsy operand; `||` stops at the first truthy.
+        let decisive = if all_required {
+            !v.is_truthy()
+        } else {
+            v.is_truthy()
+        };
+        decided = decisive;
+        operands.push(Operand {
+            text: render(part),
+            sides: comparison_sides(part, ctx)?,
+            value: Some(v),
+            decisive,
+        });
+    }
+    Ok(CondBreakdown {
+        value,
+        all_required,
+        operands,
+    })
+}
+
+/// If `ast` is a comparison, evaluate and render both sides (so an explanation
+/// can show `github.ref = 'refs/heads/feature'` behind a `== 'main'` operand).
+fn comparison_sides(ast: &Ast, ctx: &Context) -> Result<Option<(String, Value, String, Value)>> {
+    match ast {
+        Ast::Binary(
+            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge,
+            l,
+            r,
+        ) => Ok(Some((render(l), eval(l, ctx)?, render(r), eval(r, ctx)?))),
+        _ => Ok(None),
+    }
+}
+
+/// Flatten a left-associative chain of one operator into its operands.
+fn flatten_chain<'a>(ast: &'a Ast, op: &BinOp) -> Vec<&'a Ast> {
+    match ast {
+        Ast::Binary(o, l, r) if o == op => {
+            let mut v = flatten_chain(l, op);
+            v.extend(flatten_chain(r, op));
+            v
+        }
+        _ => vec![ast],
+    }
+}
+
+/// Render an AST node back to readable expression text.
+fn render(ast: &Ast) -> String {
+    match ast {
+        Ast::Null => "null".to_string(),
+        Ast::Bool(b) => b.to_string(),
+        Ast::Number(n) => Value::Number(*n).to_display_string(),
+        Ast::Str(s) => format!("'{}'", s.replace('\'', "''")),
+        Ast::Ident(name) => name.clone(),
+        Ast::Property(obj, name) => format!("{}.{name}", render(obj)),
+        Ast::Index(obj, idx) => format!("{}[{}]", render(obj), render(idx)),
+        Ast::Star(obj) => format!("{}.*", render(obj)),
+        Ast::Call(name, args) => {
+            let a = args.iter().map(render).collect::<Vec<_>>().join(", ");
+            format!("{name}({a})")
+        }
+        Ast::Not(inner) => format!("!{}", render(inner)),
+        Ast::Binary(op, l, r) => format!("{} {} {}", render(l), render_op(op), render(r)),
+    }
+}
+
+fn render_op(op: &BinOp) -> &'static str {
+    match op {
+        BinOp::And => "&&",
+        BinOp::Or => "||",
+        BinOp::Eq => "==",
+        BinOp::Ne => "!=",
+        BinOp::Lt => "<",
+        BinOp::Le => "<=",
+        BinOp::Gt => ">",
+        BinOp::Ge => ">=",
+    }
 }
 
 fn ast_calls_status(ast: &Ast) -> bool {
@@ -1055,5 +1200,42 @@ mod tests {
         );
         std::fs::write(dir.path().join("a.txt"), b"world").unwrap();
         assert_ne!(evaluate("hashFiles('*.txt')", &c).unwrap(), h1);
+    }
+
+    #[test]
+    fn explain_condition_breaks_down_an_and_chain() {
+        // ctx(): github.ref = refs/heads/main, event_name = push.
+        let c = ctx();
+        let b = explain_condition(
+            "success() && github.ref == 'refs/heads/main' && github.event_name == 'pull_request'",
+            &c,
+        )
+        .unwrap();
+        assert_eq!(b.value, Value::Bool(false));
+        assert!(b.all_required);
+        assert_eq!(b.operands.len(), 3);
+        // success() truthy, ref==main truthy, event==pull_request FALSE (decisive).
+        assert_eq!(b.operands[0].value, Some(Value::Bool(true)));
+        assert!(!b.operands[0].decisive);
+        assert_eq!(b.operands[1].value, Some(Value::Bool(true)));
+        assert_eq!(b.operands[2].value, Some(Value::Bool(false)));
+        assert!(b.operands[2].decisive);
+    }
+
+    #[test]
+    fn explain_condition_honors_short_circuit_and_resolves_sides() {
+        let c = ctx();
+        // `false && …` — the RHS is never evaluated, so its value is None.
+        let b = explain_condition("false && github.event_name == 'push'", &c).unwrap();
+        assert!(b.operands[0].decisive);
+        assert_eq!(b.operands[1].value, None);
+
+        // A single comparison exposes its resolved sides.
+        let b = explain_condition("github.ref == 'refs/heads/dev'", &c).unwrap();
+        let (lt, lv, rt, rv) = b.operands[0].sides.clone().unwrap();
+        assert_eq!(lt, "github.ref");
+        assert_eq!(lv, Value::Str("refs/heads/main".into()));
+        assert_eq!(rt, "'refs/heads/dev'");
+        assert_eq!(rv, Value::Str("refs/heads/dev".into()));
     }
 }

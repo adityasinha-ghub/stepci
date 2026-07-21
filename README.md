@@ -176,6 +176,13 @@ the common functions. Deferred or approximate:
   trip `set -e` — not an explicit `exit N`, a failure inside a shell function, or
   one the script already handles (those still show the exit code). Secrets in the
   reported line are masked.
+- **Skip explainer.** When a step is **skipped**, stepci says *why* — not just
+  "skipped". If a prior step failed, it says so (and that `always()`/`failure()`
+  would override it). If the `if:` was false, it breaks the condition into its
+  `&&`/`||` operands and shows which one decided it, with the values the runner
+  actually computed — e.g. `✗ github.ref == 'refs/heads/main' = false (github.ref
+  = 'refs/heads/feature')`. Operands the runner short-circuited past are shown as
+  *not evaluated* (never re-run behind your back), and secret values are masked.
 - **Native execution inherits your host environment** and runs on your host OS
   (`runs-on` is informational). Convenient, but not a hermetic Ubuntu runner.
 - **One shared workspace, no per-job isolation.** GitHub gives every job and

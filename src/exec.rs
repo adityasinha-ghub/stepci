@@ -500,7 +500,10 @@ fn run_step(
         None => state.status == JobStatus::Success,
     };
     if !should_run {
-        println!("skipped (if condition false)");
+        println!("skipped");
+        for line in explain_skip(step.if_cond.as_deref(), &ctx)? {
+            println!("      {}", mask_secrets(&line, &opts.secrets));
+        }
         record_step(state, step, "skipped", "skipped", IndexMap::new());
         return Ok(Flow::Continue);
     }
@@ -1791,7 +1794,10 @@ fn run_composite(
         let _ = std::io::stdout().flush();
 
         if !should_run {
-            println!("skipped (if)");
+            println!("skipped");
+            for line in explain_skip(cstep.if_cond.as_deref(), &ctx)? {
+                println!("  │     {}", mask_secrets(&line, &opts.secrets));
+            }
             record_composite_step(&mut comp_steps, cstep, "skipped", "skipped", Vec::new());
             continue;
         }
@@ -2570,6 +2576,72 @@ fn eval_condition(raw: &str, ctx: &Context) -> Result<bool> {
         Ok(value.is_truthy())
     } else {
         Ok(ctx.status == JobStatus::Success && value.is_truthy())
+    }
+}
+
+/// Explain why a step was skipped: a prior failure (the implicit `success()`
+/// guard), or an `if:` that evaluated false — broken into its operands, each
+/// with the value the runner actually computed. Mirrors [`eval_condition`].
+fn explain_skip(if_cond: Option<&str>, ctx: &Context) -> Result<Vec<String>> {
+    let Some(raw) = if_cond else {
+        // No `if:` → skipped only because a prior step failed.
+        return Ok(vec![
+            "↳ a previous step failed — steps run only after success by default".to_string(),
+        ]);
+    };
+    let inner = strip_expr_wrapper(raw.trim());
+    // Without a status function, `if:` is implicitly `success() && (…)`. If the
+    // job already failed, that guard — not the condition — is why it's skipped.
+    if !expr::references_status_function(inner)? && ctx.status != JobStatus::Success {
+        return Ok(vec![
+            "↳ a previous step failed, and this `if:` has no status check".to_string(),
+            format!("    (add `always()` or `failure()` to run `{inner}` anyway)"),
+        ]);
+    }
+    // The condition itself is false — show which operand(s) made it so.
+    let b = expr::explain_condition(inner, ctx)?;
+    let mut lines = vec![format!("↳ `if:` was {}", show_value(&b.value))];
+    for op in &b.operands {
+        // Resolve the dynamic sides of a comparison (hiding literals that render
+        // to themselves), e.g. `github.ref = 'refs/heads/feature'`.
+        let extras: Vec<String> = op
+            .sides
+            .iter()
+            .flat_map(|(lt, lv, rt, rv)| [(lt, lv), (rt, rv)])
+            .filter(|(text, val)| **text != show_value(val))
+            .map(|(text, val)| format!("{text} = {}", show_value(val)))
+            .collect();
+        // A single operand just restates the header — skip unless it adds sides.
+        if b.operands.len() == 1 && extras.is_empty() {
+            continue;
+        }
+        let marker = match &op.value {
+            Some(_) if op.decisive => "✗",
+            Some(_) => "·",
+            None => "–",
+        };
+        let val = match &op.value {
+            Some(v) => show_value(v),
+            None => "not evaluated (short-circuited)".to_string(),
+        };
+        let suffix = if extras.is_empty() {
+            String::new()
+        } else {
+            format!("  ({})", extras.join(", "))
+        };
+        lines.push(format!("    {marker} {} = {val}{suffix}", op.text));
+    }
+    Ok(lines)
+}
+
+/// Render a value briefly for a skip explanation.
+fn show_value(v: &Value) -> String {
+    match v {
+        Value::Null => "null".to_string(),
+        Value::Str(s) if s.is_empty() => "'' (empty)".to_string(),
+        Value::Str(s) => format!("'{s}'"),
+        Value::Bool(b) => b.to_string(),
+        other => other.to_display_string(),
     }
 }
 

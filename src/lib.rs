@@ -17,6 +17,7 @@ pub mod expr;
 pub mod fetch;
 pub mod model;
 pub mod parse;
+pub mod record;
 pub mod secrets;
 pub mod value;
 pub mod wfcmd;

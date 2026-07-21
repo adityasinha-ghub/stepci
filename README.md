@@ -6,12 +6,15 @@
 > ⚠️ **Status: 0.x — broadly working, not yet 1.0.** `stepci run` executes a
 > workflow natively: `run:` steps and **composite, JavaScript, and Docker
 > `uses:` actions** (local *and* remote), `${{ }}` expressions, `if:`/`needs`,
-> **matrix**, and stdout `::workflow-commands::`. It shows a **per-step diff** of
-> what changed, can **pause** for an interactive shell, resolves **secrets**
-> (`op://`/`vault://`), and passes **artifacts** between jobs. Docker is used
-> only for Docker actions. Not yet: `actions/cache`, service containers,
-> macOS/Windows fidelity. This README stays honest about the edges — see
-> [Scope](#scope-honest-boundaries) and [Roadmap](#roadmap).
+> **matrix**, `actions/cache`, service containers, and stdout
+> `::workflow-commands::`. It shows a **per-step diff** of what changed, **points
+> at the exact line that failed** and **explains why a step was skipped**, can
+> **pause** for an interactive shell, resolves **secrets** (`op://`/`vault://`),
+> passes **artifacts** between jobs, and **records every run** to re-open later
+> (`stepci show`). Docker is used only for Docker actions. Not yet: full-content
+> time-travel/run-diff, `container:` jobs, macOS/Windows fidelity. This README
+> stays honest about the edges — see [Scope](#scope-honest-boundaries) and
+> [Roadmap](#roadmap).
 
 **A native, Dockerless debugger for GitHub Actions — step through a workflow run
 on your own machine, see exactly what each step changed, using your real secrets.**
@@ -58,6 +61,33 @@ stepci run .github/workflows/ci.yml --step
      shell: bash   cwd: /repo
      [c]ontinue  [s]hell  [i]nfo  s[k]ip  [q]uit >
 ```
+
+**Look back at past runs** — every run is **recorded**, so you can re-open a
+finished run and see what each step changed, days later — no re-running:
+
+```
+stepci runs          # list recent runs (newest first)
+stepci show          # re-open the most recent run
+stepci show 3        # re-open the 3rd-most-recent
+```
+
+```
+● recording of `ci.yml` — 2m ago, ✗ failed
+● job build (build)
+  ✓ step 1: Compile
+    files:
+      + out/app
+  ⤼ step 2: only main
+      ↳ `if:` was false
+          ✗ github.ref == 'refs/heads/prod' = false  (github.ref = 'refs/heads/main')
+  ✗ step 3: Deploy
+      ↳ failed at line 2: cp missing there (exit 1)
+```
+
+Recordings live under `~/.cache/stepci/runs` (the last 50; use `--no-record` to
+skip). v0 stores each step's **diff and metadata** — what changed, why a step
+skipped, where it failed — not full file contents; secrets are masked. (Storing
+full contents to *replay* or *diff* runs is on the [roadmap](#roadmap).)
 
 ## Why not just use `act`?
 
@@ -281,7 +311,8 @@ has no inline `#` comments — the whole value after `=` is the secret.
 - [x] Service containers (`services:`) — start via Docker, host-published ports, readiness wait, auto-teardown
 - [x] JS action `post` hooks (reverse order, `$GITHUB_STATE` → `STATE_*` round-trip)
 - [ ] Fidelity/hardening (JS `pre`, `container:` jobs, real-workflow testing)
-- [ ] Session recording → replayable script; **publish**
+- [x] Run **recording** — `stepci runs`/`show` re-open a finished run's per-step diffs
+- [ ] Full-content checkpoints → time-travel (materialize any step's world), run-diff, flake-prover
 
 ## Install
 

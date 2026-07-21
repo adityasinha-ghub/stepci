@@ -26,6 +26,7 @@ use crate::expr::{self, Context, JobStatus};
 use crate::fetch;
 use crate::model::{ActionDef, Conditional, Job, Runs, Step, StepAction, Workflow};
 use crate::parse;
+use crate::record;
 use crate::value::Value;
 use crate::wfcmd;
 
@@ -48,6 +49,10 @@ pub struct RunOptions {
     /// Run-local store backing the `upload-artifact`/`download-artifact` shims,
     /// so artifacts pass between jobs without GitHub's artifact service.
     pub artifacts: PathBuf,
+    /// The workflow file as invoked, stored in the recording for display.
+    pub workflow: String,
+    /// Whether to persist this run as a re-openable recording.
+    pub record: bool,
 }
 
 /// What to do after a step: keep going, or the user asked to quit the run.
@@ -83,6 +88,11 @@ pub fn run_workflow(wf: &Workflow, opts: &RunOptions) -> Result<i32> {
     }
     warn_unknown_breakpoints(wf, opts);
 
+    let started_unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let mut job_records: Vec<record::JobRecord> = Vec::new();
     let mut quit = false;
     let mut results: IndexMap<String, JobResult> = IndexMap::new();
     'jobs: for id in &order {
@@ -156,8 +166,15 @@ pub fn run_workflow(wf: &Workflow, opts: &RunOptions) -> Result<i32> {
             }
 
             println!("\n● job {id}{suffix} ({label})");
-            let (status, flow) =
+            let (status, flow, step_records) =
                 run_job(job, wf, &github, &runner, opts, interactive, &matrix_ctx)?;
+            job_records.push(record::JobRecord {
+                id: id.clone(),
+                name: job.name.clone(),
+                matrix: suffix.clone(),
+                status: status_str(status).to_string(),
+                steps: step_records,
+            });
             if status == JobStatus::Failure {
                 job_result = JobResult::Failed;
             } else if job_result == JobResult::Skipped {
@@ -180,13 +197,30 @@ pub fn run_workflow(wf: &Workflow, opts: &RunOptions) -> Result<i32> {
     // A real failure outranks a user quit; a clean quit is reported as 130
     // (interrupted) so it isn't mistaken for success.
     let failed = results.values().any(|r| *r == JobResult::Failed);
-    Ok(if failed {
+    let code = if failed {
         1
     } else if quit {
         130
     } else {
         0
-    })
+    };
+
+    // Persist the run as a re-openable recording (best-effort; never fails a run).
+    if opts.record {
+        let rec = record::RunRecord {
+            format_version: record::FORMAT_VERSION,
+            stepci_version: env!("CARGO_PKG_VERSION").to_string(),
+            workflow: opts.workflow.clone(),
+            started_unix_ms,
+            exit_code: code,
+            jobs: job_records,
+        };
+        if let Err(e) = record::save(&rec) {
+            eprintln!("note: could not save run recording: {e:#}");
+        }
+    }
+
+    Ok(code)
 }
 
 /// Warn once about `--break` ids that match no step, so a typo isn't silent.
@@ -331,6 +365,8 @@ struct JobState {
     /// Cleanup work registered during the job (JS `post` scripts, cache saves),
     /// executed in reverse order after the job's steps.
     post: Vec<PostAction>,
+    /// Per-step records accumulated for the run recording.
+    records: Vec<record::StepRecord>,
 }
 
 /// Work registered during a job to run after its steps, in reverse (LIFO) order.
@@ -386,7 +422,7 @@ fn run_job(
     opts: &RunOptions,
     interactive: bool,
     matrix: &IndexMap<String, Value>,
-) -> Result<(JobStatus, Flow)> {
+) -> Result<(JobStatus, Flow, Vec<record::StepRecord>)> {
     let mut state = JobState {
         env: IndexMap::new(),
         path: Vec::new(),
@@ -394,6 +430,7 @@ fn run_job(
         matrix: matrix.clone(),
         status: JobStatus::Success,
         post: Vec::new(),
+        records: Vec::new(),
     };
 
     // Layer workflow then job env, interpolating each value as it's added so it
@@ -449,7 +486,7 @@ fn run_job(
         run_post_actions(&mut state, github, runner, opts);
     }
 
-    Ok((state.status, flow_out))
+    Ok((state.status, flow_out, std::mem::take(&mut state.records)))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -501,9 +538,21 @@ fn run_step(
     };
     if !should_run {
         println!("skipped");
-        for line in explain_skip(step.if_cond.as_deref(), &ctx)? {
-            println!("      {}", mask_secrets(&line, &opts.secrets));
+        let reason: Vec<String> = explain_skip(step.if_cond.as_deref(), &ctx)?
+            .iter()
+            .map(|l| mask_secrets(l, &opts.secrets))
+            .collect();
+        for line in &reason {
+            println!("      {line}");
         }
+        state.records.push(record::StepRecord {
+            number,
+            label: label.clone(),
+            kind: step_kind(step),
+            outcome: "skipped".to_string(),
+            skip_reason: reason,
+            ..Default::default()
+        });
         record_step(state, step, "skipped", "skipped", IndexMap::new());
         return Ok(Flow::Continue);
     }
@@ -613,6 +662,21 @@ fn run_step(
         print_shell_failure(f, &opts.secrets, "    ");
     }
     print_diff(&env_delta, &fs_delta, &opts.secrets);
+    let failure = io
+        .failure
+        .as_ref()
+        .map(|f| shell_failure_summary(f, &opts.secrets));
+    state.records.push(make_step_record(
+        number,
+        &label,
+        "run".to_string(),
+        outcome,
+        Some(code),
+        &env_delta,
+        &fs_delta,
+        failure,
+        &opts.secrets,
+    ));
     Ok(Flow::Continue)
 }
 
@@ -785,6 +849,17 @@ fn run_uses_step(
         (false, _) => println!("  ✗ step {number} failed"),
     }
     print_diff(&env_delta, &fs_delta, &opts.secrets);
+    state.records.push(make_step_record(
+        number,
+        &step_label(step),
+        format!("uses:{reference}"),
+        outcome,
+        None,
+        &env_delta,
+        &fs_delta,
+        None,
+        &opts.secrets,
+    ));
     Ok(Flow::Continue)
 }
 
@@ -844,6 +919,17 @@ fn run_artifact_shim(
         (false, _) => println!("  ✗ step {number} failed"),
     }
     print_diff(&env_delta, &fs_delta, &opts.secrets);
+    state.records.push(make_step_record(
+        number,
+        &step_label(step),
+        "artifact".to_string(),
+        outcome,
+        None,
+        &env_delta,
+        &fs_delta,
+        None,
+        &opts.secrets,
+    ));
     Ok(Flow::Continue)
 }
 
@@ -995,6 +1081,17 @@ fn run_cache_action(
         (false, _) => println!("  ✗ step {number} failed"),
     }
     print_diff(&env_delta, &fs_delta, &opts.secrets);
+    state.records.push(make_step_record(
+        number,
+        &step_label(step),
+        "cache".to_string(),
+        outcome,
+        None,
+        &env_delta,
+        &fs_delta,
+        None,
+        &opts.secrets,
+    ));
     Ok(Flow::Continue)
 }
 
@@ -2104,6 +2201,56 @@ fn fmt_entry(entry: &Entry) -> String {
     }
 }
 
+/// The recorded `kind` for a step (`run` or `uses:<ref>`).
+fn step_kind(step: &Step) -> String {
+    match &step.action {
+        StepAction::Run { .. } => "run".to_string(),
+        StepAction::Uses { action, .. } => format!("uses:{action}"),
+    }
+}
+
+/// Build a per-step record from its diff and outcome, masking secrets in the
+/// stored values (a recording is persisted, so it must not leak secrets).
+#[allow(clippy::too_many_arguments)]
+fn make_step_record(
+    number: usize,
+    label: &str,
+    kind: String,
+    outcome: &str,
+    exit_code: Option<i32>,
+    env: &EnvDiff,
+    fs: &FsDiff,
+    failure: Option<String>,
+    secrets: &IndexMap<String, String>,
+) -> record::StepRecord {
+    let m = |s: &str| mask_secrets(s, secrets);
+    record::StepRecord {
+        number,
+        label: label.to_string(),
+        kind,
+        outcome: outcome.to_string(),
+        exit_code,
+        env_added: env.added.iter().map(|(k, v)| (k.clone(), m(v))).collect(),
+        env_changed: env
+            .changed
+            .iter()
+            .map(|(k, o, n)| (k.clone(), m(o), m(n)))
+            .collect(),
+        env_removed: env.removed.clone(),
+        path_added: env.path_added.clone(),
+        files_added: fs.added.iter().map(|e| m(&fmt_entry(e))).collect(),
+        files_removed: fs.removed.iter().map(|e| m(&fmt_entry(e))).collect(),
+        files_modified: fs
+            .modified
+            .iter()
+            .map(|p| m(&p.display().to_string()))
+            .collect(),
+        files_truncated: fs.truncated,
+        failure: failure.map(|f| m(&f)),
+        skip_reason: Vec::new(),
+    }
+}
+
 /// Truncate a long value for single-line display.
 fn clip(s: &str) -> String {
     const MAX: usize = 80;
@@ -2291,9 +2438,9 @@ fn parse_shell_trace(trace: &str, script: &str) -> Option<ShellFailure> {
     })
 }
 
-/// Print where a bash step's script failed: the line, its (masked) source, the
-/// exit code, and — for a pipeline — which stage failed.
-fn print_shell_failure(f: &ShellFailure, secrets: &IndexMap<String, String>, indent: &str) {
+/// Summarize where a bash step's script failed: the line, its (masked) source,
+/// the exit code, and — for a pipeline — which stage failed.
+fn shell_failure_summary(f: &ShellFailure, secrets: &IndexMap<String, String>) -> String {
     let location = match &f.source_line {
         Some(src) => format!("line {}: {}", f.line, clip(&mask_secrets(src, secrets))),
         None => format!("line {}", f.line),
@@ -2308,7 +2455,11 @@ fn print_shell_failure(f: &ShellFailure, secrets: &IndexMap<String, String>, ind
         ),
         _ => format!(" (exit {})", f.exit),
     };
-    println!("{indent}↳ failed at {location}{detail}");
+    format!("failed at {location}{detail}")
+}
+
+fn print_shell_failure(f: &ShellFailure, secrets: &IndexMap<String, String>, indent: &str) {
+    println!("{indent}↳ {}", shell_failure_summary(f, secrets));
 }
 
 /// Build the command and run it, capturing stdout for workflow commands and (for
@@ -2893,6 +3044,8 @@ mod tests {
             breakpoints: breakpoints.iter().map(|s| s.to_string()).collect(),
             secrets: IndexMap::new(),
             artifacts: std::env::temp_dir().join("stepci-artifacts-test"),
+            workflow: "test.yml".to_string(),
+            record: false,
         }
     }
 

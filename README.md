@@ -167,6 +167,15 @@ the common functions. Deferred or approximate:
     that gets repointed) therefore stays pinned to the first-fetched commit until
     you clear the cache (`rm -rf ~/.cache/stepci`). Immutable refs (a full SHA or
     a fixed tag) are unaffected.
+- **Failing-line pinpoint.** When a **bash** `run:` step fails, stepci points at
+  the exact line and command that aborted it — e.g. `↳ failed at line 3: rsync -a
+  build/ dist/ (exit 23)` — and for a pipeline it names the failing stage (`pipe
+  stage 1 of 2 exited 6`), so you don't scan a 40-line log. It works by sourcing
+  the body under a private-FD `ERR` trap (no effect on the step's real output).
+  Scope: **bash only** (not `sh`/`python`/custom shells), and only failures that
+  trip `set -e` — not an explicit `exit N`, a failure inside a shell function, or
+  one the script already handles (those still show the exit code). Secrets in the
+  reported line are masked.
 - **Native execution inherits your host environment** and runs on your host OS
   (`runs-on` is informational). Convenient, but not a hermetic Ubuntu runner.
 - **One shared workspace, no per-job isolation.** GitHub gives every job and

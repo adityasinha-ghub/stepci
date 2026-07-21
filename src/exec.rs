@@ -606,6 +606,9 @@ fn run_step(
         }
         (false, _) => println!("  ✗ step {number} failed (exit {code})"),
     }
+    if let Some(f) = &io.failure {
+        print_shell_failure(f, &opts.secrets, "    ");
+    }
     print_diff(&env_delta, &fs_delta, &opts.secrets);
     Ok(Flow::Continue)
 }
@@ -1854,6 +1857,9 @@ fn run_composite(
             (false, "success") => println!("  │   ⚠ failed (exit {code}) — continue-on-error"),
             (false, _) => println!("  │   ✗ failed (exit {code})"),
         }
+        if let Some(f) = &io.failure {
+            print_shell_failure(f, &opts.secrets, "  │   ");
+        }
     }
 
     // Evaluate the action's declared outputs against the final composite context.
@@ -2231,7 +2237,76 @@ fn mask_line(s: &str, masks: &[String]) -> String {
     out
 }
 
-/// Build the command and run it, capturing stdout for workflow commands.
+/// Where and how a bash step's script failed, recovered from the FD-9 trace.
+struct ShellFailure {
+    /// The 1-based line number in the step's script that failed.
+    line: usize,
+    /// The failing command's exit code.
+    exit: i32,
+    /// Per-stage exit codes, when the failing command was a pipeline.
+    pipestatus: Vec<i32>,
+    /// The script's source line at `line`, if available.
+    source_line: Option<String>,
+}
+
+/// A bash wrapper that sources the step body under a private FD-9 ERR trap: when
+/// a command aborts the step (`set -e`), the trap records its line, exit code,
+/// and pipe status to FD 9 — without touching the step's real stdout/stderr.
+/// `$LINENO` inside the sourced body is the body's own line number.
+const BASH_TRACE_WRAPPER: &str = r#"exec 9>"$__STEPCI_TRACE" || exec 9>/dev/null
+trap 'printf "@E\t%s\t%s\t%s\n" "$LINENO" "$?" "${PIPESTATUS[*]}" >&9 2>/dev/null' ERR
+source "$__STEPCI_BODY"
+"#;
+
+/// Parse the FD-9 trace an ERR trap wrote, pairing the aborting line number with
+/// the step's script text. Returns the last (aborting) failure, if any.
+fn parse_shell_trace(trace: &str, script: &str) -> Option<ShellFailure> {
+    let last = trace.lines().rev().find(|l| l.starts_with("@E\t"))?;
+    let mut fields = last.splitn(4, '\t');
+    fields.next()?; // "@E"
+    let line: usize = fields.next()?.trim().parse().ok()?;
+    let exit: i32 = fields.next()?.trim().parse().ok()?;
+    let pipestatus: Vec<i32> = fields
+        .next()
+        .unwrap_or("")
+        .split_whitespace()
+        .filter_map(|n| n.parse().ok())
+        .collect();
+    let source_line = line
+        .checked_sub(1)
+        .and_then(|i| script.lines().nth(i))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    Some(ShellFailure {
+        line,
+        exit,
+        pipestatus,
+        source_line,
+    })
+}
+
+/// Print where a bash step's script failed: the line, its (masked) source, the
+/// exit code, and — for a pipeline — which stage failed.
+fn print_shell_failure(f: &ShellFailure, secrets: &IndexMap<String, String>, indent: &str) {
+    let location = match &f.source_line {
+        Some(src) => format!("line {}: {}", f.line, clip(&mask_secrets(src, secrets))),
+        None => format!("line {}", f.line),
+    };
+    let detail = match f.pipestatus.iter().position(|&c| c != 0) {
+        Some(i) if f.pipestatus.len() > 1 => format!(
+            " (exit {}; pipe stage {} of {} exited {})",
+            f.exit,
+            i + 1,
+            f.pipestatus.len(),
+            f.pipestatus[i]
+        ),
+        _ => format!(" (exit {})", f.exit),
+    };
+    println!("{indent}↳ failed at {location}{detail}");
+}
+
+/// Build the command and run it, capturing stdout for workflow commands and (for
+/// bash) the aborting line via a private FD trace.
 #[allow(clippy::too_many_arguments)]
 fn spawn_step(
     shell: &str,
@@ -2246,14 +2321,36 @@ fn spawn_step(
     path_file: &NamedTempFile,
     summary_file: &NamedTempFile,
     secrets: &IndexMap<String, String>,
-) -> Result<(ExitStatus, ScanResult)> {
+) -> Result<(ExitStatus, ScanResult, Option<ShellFailure>)> {
     let mut script_file = NamedTempFile::new().context("creating step script file")?;
     script_file
         .write_all(script.as_bytes())
         .context("writing step script")?;
     script_file.flush().ok();
 
-    let (program, args) = shell_command(shell, script_file.path());
+    // For bash, run the body under a wrapper that records the aborting line to a
+    // private FD, so a failure can point at the exact command.
+    let traced = shell == "bash";
+    let trace_file = if traced {
+        Some(NamedTempFile::new().context("creating shell trace file")?)
+    } else {
+        None
+    };
+    let wrapper_file = if traced {
+        let mut wf = NamedTempFile::new().context("creating shell wrapper")?;
+        wf.write_all(BASH_TRACE_WRAPPER.as_bytes())
+            .context("writing shell wrapper")?;
+        wf.flush().ok();
+        Some(wf)
+    } else {
+        None
+    };
+
+    let target = wrapper_file
+        .as_ref()
+        .map(|w| w.path())
+        .unwrap_or_else(|| script_file.path());
+    let (program, args) = shell_command(shell, target);
     let mut cmd = Command::new(&program);
     cmd.args(&args).current_dir(cwd);
 
@@ -2264,10 +2361,24 @@ fn spawn_step(
     cmd.env("GITHUB_OUTPUT", out_file.path());
     cmd.env("GITHUB_PATH", path_file.path());
     cmd.env("GITHUB_STEP_SUMMARY", summary_file.path());
+    if let Some(tf) = &trace_file {
+        cmd.env("__STEPCI_TRACE", tf.path());
+        cmd.env("__STEPCI_BODY", script_file.path());
+    }
 
-    // `script_file` stays alive until `run_capturing` returns (the child has
-    // exited by then), so the shell can still read it.
-    run_capturing(cmd, secrets).with_context(|| format!("launching shell `{program}` for the step"))
+    // `script_file`/`wrapper_file` stay alive until `run_capturing` returns (the
+    // child has exited by then), so the shell can still read them.
+    let (status, scan) = run_capturing(cmd, secrets)
+        .with_context(|| format!("launching shell `{program}` for the step"))?;
+
+    let failure = match &trace_file {
+        Some(tf) if !status.success() => {
+            let content = std::fs::read_to_string(tf.path()).unwrap_or_default();
+            parse_shell_trace(&content, script)
+        }
+        _ => None,
+    };
+    Ok((status, scan, failure))
 }
 
 /// The results of running one shell script: its exit status plus whatever it
@@ -2277,6 +2388,8 @@ struct StepIo {
     env_additions: Vec<(String, String)>,
     path_additions: Vec<String>,
     outputs: Vec<(String, String)>,
+    /// For a failing bash step, where in the script it aborted.
+    failure: Option<ShellFailure>,
 }
 
 /// Run a script through the shell with fresh channel files, and read the channels
@@ -2298,7 +2411,7 @@ fn execute_script(
     let path_file = NamedTempFile::new().context("creating GITHUB_PATH file")?;
     let summary_file = NamedTempFile::new().context("creating GITHUB_STEP_SUMMARY file")?;
 
-    let (status, scan) = spawn_step(
+    let (status, scan, failure) = spawn_step(
         shell,
         script,
         cwd,
@@ -2321,6 +2434,7 @@ fn execute_script(
         env_additions: read_key_values(env_file.path())?,
         path_additions: read_path_additions(path_file.path())?,
         outputs,
+        failure,
     })
 }
 
@@ -3010,6 +3124,28 @@ mod tests {
         let (p, a) = shell_command("pwsh -File {0}", Path::new("/tmp/s.ps1"));
         assert_eq!(p, "pwsh");
         assert_eq!(a, vec!["-File".to_string(), "/tmp/s.ps1".to_string()]);
+    }
+
+    #[test]
+    fn parse_shell_trace_locates_failing_line() {
+        let script = "echo hi\ncp missing dst\necho bye\n";
+        let f = parse_shell_trace("@E\t2\t1\t1\n", script).unwrap();
+        assert_eq!(f.line, 2);
+        assert_eq!(f.exit, 1);
+        assert_eq!(f.pipestatus, vec![1]);
+        assert_eq!(f.source_line.as_deref(), Some("cp missing dst"));
+    }
+
+    #[test]
+    fn parse_shell_trace_reads_pipeline_status_and_last_entry() {
+        // A pipeline whose first stage failed; the last @E line is the aborting one.
+        let script = "echo start\ncat x | wc -l\n";
+        let f = parse_shell_trace("@E\t9\t0\t0\n@E\t2\t1\t1 0\n", script).unwrap();
+        assert_eq!(f.line, 2);
+        assert_eq!(f.pipestatus, vec![1, 0]);
+        assert_eq!(f.source_line.as_deref(), Some("cat x | wc -l"));
+        // No @E → nothing to report.
+        assert!(parse_shell_trace("some stdout\n", script).is_none());
     }
 
     #[test]

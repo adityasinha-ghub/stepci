@@ -69,6 +69,8 @@ finished run and see what each step changed, days later — no re-running:
 stepci runs          # list recent runs (newest first)
 stepci show          # re-open the most recent run
 stepci show 3        # re-open the 3rd-most-recent
+stepci diff          # compare the previous run to the latest
+stepci diff 5 1      # compare the 5th-most-recent to the latest
 ```
 
 ```
@@ -312,7 +314,8 @@ has no inline `#` comments — the whole value after `=` is the secret.
 - [x] JS action `post` hooks (reverse order, `$GITHUB_STATE` → `STATE_*` round-trip)
 - [ ] Fidelity/hardening (JS `pre`, `container:` jobs, real-workflow testing)
 - [x] Run **recording** — `stepci runs`/`show` re-open a finished run's per-step diffs
-- [ ] Full-content checkpoints → time-travel (materialize any step's world), run-diff, flake-prover
+- [x] Run **diff** — `stepci diff` compares two recordings (outcome, env, file, failure changes)
+- [ ] Full-content checkpoints → time-travel (materialize any step's world), byte-accurate diff, flake-prover
 
 ## Install
 

@@ -31,6 +31,15 @@ enum Command {
         #[arg(default_value = "1")]
         run: usize,
     },
+    /// Compare two recorded runs (by recency; 1 = most recent).
+    Diff {
+        /// The "before" run (default: 2, the previous run).
+        #[arg(default_value = "2")]
+        a: usize,
+        /// The "after" run (default: 1, the most recent).
+        #[arg(default_value = "1")]
+        b: usize,
+    },
 }
 
 #[derive(Args)]
@@ -77,6 +86,7 @@ fn try_main() -> Result<()> {
         Command::Run(args) => run(args),
         Command::Runs => list_runs(),
         Command::Show { run } => show_run(run),
+        Command::Diff { a, b } => diff_runs(a, b),
     }
 }
 
@@ -152,6 +162,109 @@ fn show_run(n: usize) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// `stepci diff <a> <b>` — compare two recorded runs (by recency).
+fn diff_runs(a_idx: usize, b_idx: usize) -> Result<()> {
+    if a_idx == b_idx {
+        anyhow::bail!("pick two different runs (got #{a_idx} twice)");
+    }
+    let runs = record::list()?;
+    let get = |n: usize| runs.get(n.saturating_sub(1));
+    let (Some(a), Some(b)) = (get(a_idx), get(b_idx)) else {
+        anyhow::bail!("not enough recorded runs — `stepci runs` lists what's available");
+    };
+
+    println!(
+        "Comparing #{a_idx} ({}) → #{b_idx} ({})   [{}]",
+        relative_time(a.started_unix_ms),
+        relative_time(b.started_unix_ms),
+        b.workflow,
+    );
+    let mut any = false;
+    if a.exit_code != b.exit_code {
+        any = true;
+        println!(
+            "  overall: {} → {}",
+            outcome_word(a.exit_code),
+            outcome_word(b.exit_code)
+        );
+    }
+
+    // Align jobs by (id + matrix); within a matched job, align steps positionally.
+    let key = |j: &record::JobRecord| format!("{}{}", j.id, j.matrix);
+    let b_jobs: std::collections::HashMap<String, &record::JobRecord> =
+        b.jobs.iter().map(|j| (key(j), j)).collect();
+    let a_keys: std::collections::HashSet<String> = a.jobs.iter().map(key).collect();
+
+    for ja in &a.jobs {
+        let Some(jb) = b_jobs.get(&key(ja)) else {
+            any = true;
+            println!("  job {}{}: only in #{a_idx}", ja.id, ja.matrix);
+            continue;
+        };
+        let mut lines: Vec<String> = Vec::new();
+        if ja.steps.len() != jb.steps.len() {
+            lines.push(format!(
+                "    (structure differs: {} steps → {} — comparing positionally)",
+                ja.steps.len(),
+                jb.steps.len()
+            ));
+        }
+        for i in 0..ja.steps.len().max(jb.steps.len()) {
+            match (ja.steps.get(i), jb.steps.get(i)) {
+                (Some(sa), Some(sb)) => {
+                    let changes = record::step_changes(sa, sb);
+                    if !changes.is_empty() {
+                        let label = if sa.label == sb.label {
+                            sa.label.clone()
+                        } else {
+                            format!("{} / {}", sa.label, sb.label)
+                        };
+                        lines.push(format!("    step {}: {label}", i + 1));
+                        lines.extend(changes.into_iter().map(|c| format!("        {c}")));
+                    }
+                }
+                (Some(sa), None) => lines.push(format!(
+                    "    step {}: {} — only in #{a_idx}",
+                    i + 1,
+                    sa.label
+                )),
+                (None, Some(sb)) => lines.push(format!(
+                    "    step {}: {} — only in #{b_idx}",
+                    i + 1,
+                    sb.label
+                )),
+                (None, None) => {}
+            }
+        }
+        if !lines.is_empty() {
+            any = true;
+            println!("  job {}{}:", ja.id, ja.matrix);
+            for l in lines {
+                println!("{l}");
+            }
+        }
+    }
+    for jb in &b.jobs {
+        if !a_keys.contains(&key(jb)) {
+            any = true;
+            println!("  job {}{}: only in #{b_idx}", jb.id, jb.matrix);
+        }
+    }
+
+    if !any {
+        println!("  no differences — the runs match (as far as the recording captured).");
+    }
+    Ok(())
+}
+
+fn outcome_word(exit: i32) -> &'static str {
+    if exit == 0 {
+        "✓ passed"
+    } else {
+        "✗ failed"
+    }
 }
 
 fn render_step(s: &record::StepRecord) {

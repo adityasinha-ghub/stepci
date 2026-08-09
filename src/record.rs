@@ -146,6 +146,83 @@ fn prune() -> Result<()> {
     Ok(())
 }
 
+/// The human-readable differences between the same step across two runs (empty
+/// if the step behaved identically as far as the recording captured).
+pub fn step_changes(a: &StepRecord, b: &StepRecord) -> Vec<String> {
+    let mut out = Vec::new();
+    if a.outcome != b.outcome {
+        out.push(format!("outcome: {} → {}", a.outcome, b.outcome));
+    }
+    if a.exit_code != b.exit_code {
+        out.push(format!(
+            "exit: {} → {}",
+            opt_code(a.exit_code),
+            opt_code(b.exit_code)
+        ));
+    }
+    if a.failure != b.failure {
+        out.push(format!(
+            "failure: {} → {}",
+            a.failure.as_deref().unwrap_or("none"),
+            b.failure.as_deref().unwrap_or("none")
+        ));
+    }
+    for (k, av, bv) in map_diff(&env_effects(a), &env_effects(b)) {
+        out.push(format!("env {k}: {av} → {bv}"));
+    }
+    for (p, av, bv) in map_diff(&file_effects(a), &file_effects(b)) {
+        out.push(format!("file {p}: {av} → {bv}"));
+    }
+    out
+}
+
+fn opt_code(c: Option<i32>) -> String {
+    c.map(|c| c.to_string()).unwrap_or_else(|| "—".to_string())
+}
+
+fn env_effects(s: &StepRecord) -> std::collections::BTreeMap<String, String> {
+    let mut m = std::collections::BTreeMap::new();
+    for (k, v) in &s.env_added {
+        m.insert(k.clone(), format!("set to {v}"));
+    }
+    for (k, _, n) in &s.env_changed {
+        m.insert(k.clone(), format!("changed to {n}"));
+    }
+    for k in &s.env_removed {
+        m.insert(k.clone(), "removed".to_string());
+    }
+    m
+}
+
+fn file_effects(s: &StepRecord) -> std::collections::BTreeMap<String, String> {
+    let mut m = std::collections::BTreeMap::new();
+    for f in &s.files_added {
+        m.insert(f.clone(), "added".to_string());
+    }
+    for f in &s.files_modified {
+        m.insert(f.clone(), "modified".to_string());
+    }
+    for f in &s.files_removed {
+        m.insert(f.clone(), "removed".to_string());
+    }
+    m
+}
+
+/// Keys whose value differs between two maps, with each side's value (or `—`).
+fn map_diff(
+    a: &std::collections::BTreeMap<String, String>,
+    b: &std::collections::BTreeMap<String, String>,
+) -> Vec<(String, String, String)> {
+    let keys: std::collections::BTreeSet<&String> = a.keys().chain(b.keys()).collect();
+    keys.into_iter()
+        .filter_map(|k| {
+            let av = a.get(k).map(String::as_str).unwrap_or("—");
+            let bv = b.get(k).map(String::as_str).unwrap_or("—");
+            (av != bv).then(|| (k.clone(), av.to_string(), bv.to_string()))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -193,5 +270,33 @@ mod tests {
             "steps":[{"number":1,"label":"s","kind":"run","outcome":"success","exit_code":null}]}]}"#;
         let parsed: RunRecord = serde_json::from_str(minimal).unwrap();
         assert!(parsed.jobs[0].steps[0].env_added.is_empty());
+    }
+
+    #[test]
+    fn step_changes_reports_outcome_env_and_file_divergences() {
+        let a = StepRecord {
+            outcome: "failure".into(),
+            exit_code: Some(1),
+            env_added: vec![("V".into(), "1".into())],
+            files_modified: vec!["out/app".into()],
+            failure: Some("failed at line 2: cp x y (exit 1)".into()),
+            ..Default::default()
+        };
+        let b = StepRecord {
+            outcome: "success".into(),
+            exit_code: Some(0),
+            env_added: vec![("V".into(), "2".into())],
+            files_added: vec!["out/app".into()],
+            ..Default::default()
+        };
+        let d = step_changes(&a, &b);
+        assert!(d.iter().any(|l| l == "outcome: failure → success"));
+        assert!(d.iter().any(|l| l == "exit: 1 → 0"));
+        assert!(d.iter().any(|l| l.starts_with("failure:")));
+        assert!(d.iter().any(|l| l == "env V: set to 1 → set to 2"));
+        assert!(d.iter().any(|l| l == "file out/app: modified → added"));
+
+        // Identical steps → no changes.
+        assert!(step_changes(&a, &a).is_empty());
     }
 }

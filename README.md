@@ -87,9 +87,12 @@ stepci diff 5 1      # compare the 5th-most-recent to the latest
 ```
 
 Recordings live under `~/.cache/stepci/runs` (the last 50; use `--no-record` to
-skip). v0 stores each step's **diff and metadata** — what changed, why a step
-skipped, where it failed — not full file contents; secrets are masked. (Storing
-full contents to *replay* or *diff* runs is on the [roadmap](#roadmap).)
+skip). Each step's **diff and metadata** are stored — what changed, why a step
+skipped, where it failed — plus a **content hash** of every changed file, so
+`diff` is byte-accurate: a file rewritten to the *same* bytes isn't reported as a
+difference, and a content-preserving change still is. Secrets are masked. Full
+file *contents* aren't stored yet — materializing a step's exact world (`seek`)
+is on the [roadmap](#roadmap).
 
 ## Why not just use `act`?
 
@@ -314,8 +317,8 @@ has no inline `#` comments — the whole value after `=` is the secret.
 - [x] JS action `post` hooks (reverse order, `$GITHUB_STATE` → `STATE_*` round-trip)
 - [ ] Fidelity/hardening (JS `pre`, `container:` jobs, real-workflow testing)
 - [x] Run **recording** — `stepci runs`/`show` re-open a finished run's per-step diffs
-- [x] Run **diff** — `stepci diff` compares two recordings (outcome, env, file, failure changes)
-- [ ] Full-content checkpoints → time-travel (materialize any step's world), byte-accurate diff, flake-prover
+- [x] Run **diff** — `stepci diff` compares two recordings, byte-accurate (content-hashed files)
+- [ ] Full-content checkpoints → time-travel `seek` (materialize any step's world), single-step re-exec, flake-prover
 
 ## Install
 

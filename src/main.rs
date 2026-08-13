@@ -303,16 +303,19 @@ fn render_step(s: &record::StepRecord) {
             println!("      + PATH ⊕ {p}");
         }
     }
-    if !s.files_added.is_empty() || !s.files_removed.is_empty() || !s.files_modified.is_empty() {
+    if !s.files.is_empty() {
         println!("    files:");
-        for f in &s.files_added {
-            println!("      + {f}");
-        }
-        for f in &s.files_removed {
-            println!("      - {f}");
-        }
-        for f in &s.files_modified {
-            println!("      ~ {f}");
+        for f in &s.files {
+            let marker = match f.status.as_str() {
+                "added" => "+",
+                "removed" => "-",
+                _ => "~",
+            };
+            let name = match f.dir_files {
+                Some(n) => format!("{}/ ({n} files)", f.path),
+                None => f.path.clone(),
+            };
+            println!("      {marker} {name}");
         }
     }
     if s.files_truncated {

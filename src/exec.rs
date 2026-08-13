@@ -675,7 +675,7 @@ fn run_step(
         &env_delta,
         &fs_delta,
         failure,
-        &opts.secrets,
+        opts,
     ));
     Ok(Flow::Continue)
 }
@@ -858,7 +858,7 @@ fn run_uses_step(
         &env_delta,
         &fs_delta,
         None,
-        &opts.secrets,
+        opts,
     ));
     Ok(Flow::Continue)
 }
@@ -928,7 +928,7 @@ fn run_artifact_shim(
         &env_delta,
         &fs_delta,
         None,
-        &opts.secrets,
+        opts,
     ));
     Ok(Flow::Continue)
 }
@@ -1090,7 +1090,7 @@ fn run_cache_action(
         &env_delta,
         &fs_delta,
         None,
-        &opts.secrets,
+        opts,
     ));
     Ok(Flow::Continue)
 }
@@ -2210,7 +2210,9 @@ fn step_kind(step: &Step) -> String {
 }
 
 /// Build a per-step record from its diff and outcome, masking secrets in the
-/// stored values (a recording is persisted, so it must not leak secrets).
+/// stored values (a recording is persisted, so it must not leak secrets) and
+/// content-hashing individual changed files (when recording) for byte-accurate
+/// diffing.
 #[allow(clippy::too_many_arguments)]
 fn make_step_record(
     number: usize,
@@ -2221,9 +2223,33 @@ fn make_step_record(
     env: &EnvDiff,
     fs: &FsDiff,
     failure: Option<String>,
-    secrets: &IndexMap<String, String>,
+    opts: &RunOptions,
 ) -> record::StepRecord {
-    let m = |s: &str| mask_secrets(s, secrets);
+    let m = |s: &str| mask_secrets(s, &opts.secrets);
+    // Hash an existing individual file, but only when we'll persist the run.
+    let hash = |rel: &Path| {
+        if opts.record {
+            record::hash_file(&opts.workspace.join(rel))
+        } else {
+            None
+        }
+    };
+    let mut files = Vec::new();
+    for e in &fs.added {
+        files.push(entry_change(e, "added", &hash, &m));
+    }
+    for p in &fs.modified {
+        files.push(record::FileChange {
+            path: m(&p.display().to_string()),
+            status: "modified".to_string(),
+            dir_files: None,
+            hash: hash(p),
+        });
+    }
+    for e in &fs.removed {
+        // Removed files are gone — no content to hash.
+        files.push(entry_change(e, "removed", &|_| None, &m));
+    }
     record::StepRecord {
         number,
         label: label.to_string(),
@@ -2238,16 +2264,35 @@ fn make_step_record(
             .collect(),
         env_removed: env.removed.clone(),
         path_added: env.path_added.clone(),
-        files_added: fs.added.iter().map(|e| m(&fmt_entry(e))).collect(),
-        files_removed: fs.removed.iter().map(|e| m(&fmt_entry(e))).collect(),
-        files_modified: fs
-            .modified
-            .iter()
-            .map(|p| m(&p.display().to_string()))
-            .collect(),
+        files,
         files_truncated: fs.truncated,
         failure: failure.map(|f| m(&f)),
         skip_reason: Vec::new(),
+    }
+}
+
+/// Turn a filesystem-diff entry into a recorded [`record::FileChange`].
+fn entry_change(
+    e: &Entry,
+    status: &str,
+    hash: &dyn Fn(&Path) -> Option<String>,
+    mask: &dyn Fn(&str) -> String,
+) -> record::FileChange {
+    match e {
+        Entry::File(p) => record::FileChange {
+            path: mask(&p.display().to_string()),
+            status: status.to_string(),
+            dir_files: None,
+            hash: hash(p),
+        },
+        // A wholly-new/removed directory (collapsed) — recorded with its count,
+        // not per-file hashes.
+        Entry::Dir(p, n) => record::FileChange {
+            path: mask(&p.display().to_string()),
+            status: status.to_string(),
+            dir_files: Some(*n),
+            hash: None,
+        },
     }
 }
 

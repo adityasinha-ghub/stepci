@@ -1,20 +1,26 @@
 //! Persist each run as a re-openable **recording** — the per-step diffs and
 //! metadata the executor already computes — so a finished run stops being a log
-//! you scroll past once and becomes a durable object you can list and re-open
-//! (`stepci runs` / `stepci show`).
+//! you scroll past once and becomes a durable object you can list, re-open, and
+//! compare (`stepci runs` / `stepci show` / `stepci diff`).
 //!
-//! v0 stores the per-step *diffs and metadata* (what each step changed), not full
-//! file contents — cheap, and enough to answer "what did step 7 do?" after the
-//! fact. Full-content checkpoints (to materialize the exact world / re-run one
+//! Each changed *individual* file is content-hashed (SHA-256, under a size cap),
+//! so a diff distinguishes "changed to the same bytes" (a mtime-only touch) from
+//! a real content change. It stores diffs + hashes, not full file *contents* —
+//! full-content checkpoints (to materialize a step's exact world or re-run one
 //! step) are a later milestone.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use sha2::{Digest, Sha256};
+use std::path::{Path, PathBuf};
 
 /// Bumped when the on-disk record shape changes, so stale records are ignored
 /// rather than mis-read.
-pub const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 2;
+
+/// Files larger than this aren't content-hashed (the diff falls back to
+/// size+mtime for them) — bounds the per-step hashing cost.
+const MAX_HASH_BYTES: u64 = 25 * 1024 * 1024;
 
 /// How many recent runs to keep on disk before pruning the oldest.
 const MAX_RUNS: usize = 50;
@@ -63,12 +69,11 @@ pub struct StepRecord {
     pub env_removed: Vec<String>,
     #[serde(default)]
     pub path_added: Vec<String>,
+    /// Files the step changed (added/modified/removed), with content hashes where
+    /// available — so a diff can tell "changed to the same content" from a real
+    /// content difference.
     #[serde(default)]
-    pub files_added: Vec<String>,
-    #[serde(default)]
-    pub files_removed: Vec<String>,
-    #[serde(default)]
-    pub files_modified: Vec<String>,
+    pub files: Vec<FileChange>,
     #[serde(default)]
     pub files_truncated: bool,
     /// For a failing bash step, the "failed at line …" summary.
@@ -77,6 +82,37 @@ pub struct StepRecord {
     /// For a skipped step, the explanation lines.
     #[serde(default)]
     pub skip_reason: Vec<String>,
+}
+
+/// One file a step added, modified, or removed.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FileChange {
+    /// Workspace-relative path (or the root of a collapsed new/removed directory).
+    pub path: String,
+    /// `added`, `modified`, or `removed`.
+    pub status: String,
+    /// For a collapsed directory, how many files it contains.
+    #[serde(default)]
+    pub dir_files: Option<usize>,
+    /// The file's content hash (individual files under the size cap only).
+    #[serde(default)]
+    pub hash: Option<String>,
+}
+
+/// Content-hash a file for byte-accurate diffing, or `None` if it's missing, not
+/// a regular file, or larger than [`MAX_HASH_BYTES`].
+pub fn hash_file(path: &Path) -> Option<String> {
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() || meta.len() > MAX_HASH_BYTES {
+        return None;
+    }
+    let bytes = std::fs::read(path).ok()?;
+    Some(
+        Sha256::digest(&bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect(),
+    )
 }
 
 /// The directory holding all recordings (`~/.cache/stepci/runs`).
@@ -170,8 +206,27 @@ pub fn step_changes(a: &StepRecord, b: &StepRecord) -> Vec<String> {
     for (k, av, bv) in map_diff(&env_effects(a), &env_effects(b)) {
         out.push(format!("env {k}: {av} → {bv}"));
     }
-    for (p, av, bv) in map_diff(&file_effects(a), &file_effects(b)) {
-        out.push(format!("file {p}: {av} → {bv}"));
+    // Files: a different status is always a divergence; the same status is one
+    // only when both content hashes exist and differ (so "both wrote the same
+    // bytes" isn't reported, and a content-preserving change still is).
+    let fa = file_index(a);
+    let fb = file_index(b);
+    let paths: std::collections::BTreeSet<&String> = fa.keys().chain(fb.keys()).collect();
+    for p in paths {
+        match (fa.get(p), fb.get(p)) {
+            (Some((sa, ha)), Some((sb, hb))) => {
+                if sa != sb {
+                    out.push(format!("file {p}: {sa} → {sb}"));
+                } else if let (Some(ha), Some(hb)) = (ha, hb)
+                    && ha != hb
+                {
+                    out.push(format!("file {p}: {sa}, content differs"));
+                }
+            }
+            (Some((sa, _)), None) => out.push(format!("file {p}: {sa} → —")),
+            (None, Some((sb, _))) => out.push(format!("file {p}: — → {sb}")),
+            (None, None) => {}
+        }
     }
     out
 }
@@ -194,18 +249,13 @@ fn env_effects(s: &StepRecord) -> std::collections::BTreeMap<String, String> {
     m
 }
 
-fn file_effects(s: &StepRecord) -> std::collections::BTreeMap<String, String> {
-    let mut m = std::collections::BTreeMap::new();
-    for f in &s.files_added {
-        m.insert(f.clone(), "added".to_string());
-    }
-    for f in &s.files_modified {
-        m.insert(f.clone(), "modified".to_string());
-    }
-    for f in &s.files_removed {
-        m.insert(f.clone(), "removed".to_string());
-    }
-    m
+type FileIndex = std::collections::BTreeMap<String, (String, Option<String>)>;
+
+fn file_index(s: &StepRecord) -> FileIndex {
+    s.files
+        .iter()
+        .map(|f| (f.path.clone(), (f.status.clone(), f.hash.clone())))
+        .collect()
 }
 
 /// Keys whose value differs between two maps, with each side's value (or `—`).
@@ -274,11 +324,20 @@ mod tests {
 
     #[test]
     fn step_changes_reports_outcome_env_and_file_divergences() {
+        let fc = |path: &str, status: &str, hash: Option<&str>| FileChange {
+            path: path.into(),
+            status: status.into(),
+            dir_files: None,
+            hash: hash.map(String::from),
+        };
         let a = StepRecord {
             outcome: "failure".into(),
             exit_code: Some(1),
             env_added: vec![("V".into(), "1".into())],
-            files_modified: vec!["out/app".into()],
+            files: vec![
+                fc("out/app", "modified", Some("aaa")),
+                fc("out/log", "modified", Some("h1")),
+            ],
             failure: Some("failed at line 2: cp x y (exit 1)".into()),
             ..Default::default()
         };
@@ -286,7 +345,10 @@ mod tests {
             outcome: "success".into(),
             exit_code: Some(0),
             env_added: vec![("V".into(), "2".into())],
-            files_added: vec!["out/app".into()],
+            files: vec![
+                fc("out/app", "added", None),
+                fc("out/log", "modified", Some("h2")),
+            ],
             ..Default::default()
         };
         let d = step_changes(&a, &b);
@@ -294,9 +356,15 @@ mod tests {
         assert!(d.iter().any(|l| l == "exit: 1 → 0"));
         assert!(d.iter().any(|l| l.starts_with("failure:")));
         assert!(d.iter().any(|l| l == "env V: set to 1 → set to 2"));
+        // Different status is always a divergence.
         assert!(d.iter().any(|l| l == "file out/app: modified → added"));
+        // Same status but different content hash → "content differs".
+        assert!(
+            d.iter()
+                .any(|l| l == "file out/log: modified, content differs")
+        );
 
-        // Identical steps → no changes.
+        // Identical steps → no changes (same status + same hash isn't a diff).
         assert!(step_changes(&a, &a).is_empty());
     }
 }

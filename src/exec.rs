@@ -2226,10 +2226,10 @@ fn make_step_record(
     opts: &RunOptions,
 ) -> record::StepRecord {
     let m = |s: &str| mask_secrets(s, &opts.secrets);
-    // Hash an existing individual file, but only when we'll persist the run.
+    // Hash + store an existing individual file's content, only when persisting.
     let hash = |rel: &Path| {
         if opts.record {
-            record::hash_file(&opts.workspace.join(rel))
+            record::hash_and_store(&opts.workspace.join(rel))
         } else {
             None
         }

@@ -40,6 +40,14 @@ enum Command {
         #[arg(default_value = "1")]
         b: usize,
     },
+    /// Print a file's recorded content from a run (as of the last step to write it).
+    Cat {
+        /// Workspace-relative path, as shown by `stepci show`/`diff`.
+        path: String,
+        /// Which run — 1 is the most recent (the default).
+        #[arg(long, default_value = "1")]
+        run: usize,
+    },
 }
 
 #[derive(Args)]
@@ -87,7 +95,25 @@ fn try_main() -> Result<()> {
         Command::Runs => list_runs(),
         Command::Show { run } => show_run(run),
         Command::Diff { a, b } => diff_runs(a, b),
+        Command::Cat { path, run } => cat_file(&path, run),
     }
+}
+
+/// `stepci cat <path> [--run n]` — print a file's recorded content from a run.
+fn cat_file(path: &str, n: usize) -> Result<()> {
+    let Some(r) = record::nth_recent(n)? else {
+        anyhow::bail!("no run #{n} — `stepci runs` lists what's recorded");
+    };
+    match record::file_content(&r, path) {
+        Some(bytes) => {
+            use std::io::Write;
+            std::io::stdout().write_all(&bytes).ok();
+        }
+        None => anyhow::bail!(
+            "`{path}` wasn't captured in run #{n} (not changed by a step, too large, or a directory)"
+        ),
+    }
+    Ok(())
 }
 
 fn run(args: RunArgs) -> Result<()> {
@@ -215,7 +241,8 @@ fn diff_runs(a_idx: usize, b_idx: usize) -> Result<()> {
             match (ja.steps.get(i), jb.steps.get(i)) {
                 (Some(sa), Some(sb)) => {
                     let changes = record::step_changes(sa, sb);
-                    if !changes.is_empty() {
+                    let content = content_diff_lines(sa, sb);
+                    if !changes.is_empty() || !content.is_empty() {
                         let label = if sa.label == sb.label {
                             sa.label.clone()
                         } else {
@@ -223,6 +250,7 @@ fn diff_runs(a_idx: usize, b_idx: usize) -> Result<()> {
                         };
                         lines.push(format!("    step {}: {label}", i + 1));
                         lines.extend(changes.into_iter().map(|c| format!("        {c}")));
+                        lines.extend(content);
                     }
                 }
                 (Some(sa), None) => lines.push(format!(
@@ -265,6 +293,55 @@ fn outcome_word(exit: i32) -> &'static str {
     } else {
         "✗ failed"
     }
+}
+
+/// Line-level content diffs for files both steps changed to *different* content
+/// (using the stored blobs). Text only; capped; binary content is noted, not dumped.
+fn content_diff_lines(sa: &record::StepRecord, sb: &record::StepRecord) -> Vec<String> {
+    use similar::{ChangeTag, TextDiff};
+    const MAX_LINES: usize = 40;
+
+    let after: std::collections::HashMap<&str, &record::FileChange> =
+        sb.files.iter().map(|f| (f.path.as_str(), f)).collect();
+    let mut out = Vec::new();
+    for fa in &sa.files {
+        let Some(fb) = after.get(fa.path.as_str()) else {
+            continue;
+        };
+        let (Some(ha), Some(hb)) = (&fa.hash, &fb.hash) else {
+            continue;
+        };
+        if ha == hb {
+            continue;
+        }
+        let (Some(ba), Some(bb)) = (record::load_blob(ha), record::load_blob(hb)) else {
+            continue; // blob unavailable (e.g. GC'd) — the summary line already noted it
+        };
+        match (std::str::from_utf8(&ba), std::str::from_utf8(&bb)) {
+            (Ok(ta), Ok(tb)) => {
+                out.push(format!("        ─ {} ─", fa.path));
+                let mut shown = 0;
+                for change in TextDiff::from_lines(ta, tb).iter_all_changes() {
+                    let sign = match change.tag() {
+                        ChangeTag::Delete => "-",
+                        ChangeTag::Insert => "+",
+                        ChangeTag::Equal => continue, // only show the changed lines
+                    };
+                    if shown >= MAX_LINES {
+                        out.push("          … (diff truncated)".to_string());
+                        break;
+                    }
+                    out.push(format!(
+                        "          {sign} {}",
+                        change.value().trim_end_matches('\n')
+                    ));
+                    shown += 1;
+                }
+            }
+            _ => out.push(format!("        ─ {} ─ (binary content differs)", fa.path)),
+        }
+    }
+    out
 }
 
 fn render_step(s: &record::StepRecord) {

@@ -66,11 +66,23 @@ stepci run .github/workflows/ci.yml --step
 finished run and see what each step changed, days later — no re-running:
 
 ```
-stepci runs          # list recent runs (newest first)
-stepci show          # re-open the most recent run
-stepci show 3        # re-open the 3rd-most-recent
-stepci diff          # compare the previous run to the latest
-stepci diff 5 1      # compare the 5th-most-recent to the latest
+stepci runs                # list recent runs (newest first)
+stepci show                # re-open the most recent run
+stepci show 3              # re-open the 3rd-most-recent
+stepci diff                # compare the previous run to the latest
+stepci diff 5 1            # compare the 5th-most-recent to the latest
+stepci cat config.yml      # print a file's content as recorded in the latest run
+```
+
+`diff` shows the **actual line-level change** to a file between two runs (not just
+"it changed"):
+
+```
+step 1: … / …
+    file config.yml: modified, content differs
+    ─ config.yml ─
+      - port: 8080
+      + port: 9090
 ```
 
 ```
@@ -88,11 +100,19 @@ stepci diff 5 1      # compare the 5th-most-recent to the latest
 
 Recordings live under `~/.cache/stepci/runs` (the last 50; use `--no-record` to
 skip). Each step's **diff and metadata** are stored — what changed, why a step
-skipped, where it failed — plus a **content hash** of every changed file, so
-`diff` is byte-accurate: a file rewritten to the *same* bytes isn't reported as a
-difference, and a content-preserving change still is. Secrets are masked. Full
-file *contents* aren't stored yet — materializing a step's exact world (`seek`)
-is on the [roadmap](#roadmap).
+skipped, where it failed — and each changed file's **content** goes into a
+deduplicated, content-addressed blob store (`~/.cache/stepci/blobs`, garbage-
+collected to what the kept runs reference). That's what powers byte-accurate
+`diff`, the line-level content diff, and `cat`.
+
+> ⚠️ **Recorded file contents are stored raw.** Environment values are masked in
+> a recording, but a changed file's *contents* are not (stepci can't know which
+> bytes are secret). So a file a step writes a token into will hold that token in
+> the local blob store — no worse than the file already sitting in your
+> workspace, but it persists on your machine until pruned. Use `--no-record` for
+> sensitive runs. Individual files over 25 MiB aren't stored (diff falls back to
+> size+mtime). Materializing a step's *whole* world and re-running one step are
+> still on the [roadmap](#roadmap).
 
 ## Why not just use `act`?
 
@@ -317,8 +337,9 @@ has no inline `#` comments — the whole value after `=` is the secret.
 - [x] JS action `post` hooks (reverse order, `$GITHUB_STATE` → `STATE_*` round-trip)
 - [ ] Fidelity/hardening (JS `pre`, `container:` jobs, real-workflow testing)
 - [x] Run **recording** — `stepci runs`/`show` re-open a finished run's per-step diffs
-- [x] Run **diff** — `stepci diff` compares two recordings, byte-accurate (content-hashed files)
-- [ ] Full-content checkpoints → time-travel `seek` (materialize any step's world), single-step re-exec, flake-prover
+- [x] Run **diff** — `stepci diff` compares two recordings, byte-accurate, with line-level file content diffs
+- [x] Content-addressed **blob store** + `stepci cat` — view a file's recorded content from a past run
+- [ ] Materialize a step's *whole* world + single-step re-exec; flake-prover
 
 ## Install
 

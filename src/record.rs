@@ -99,28 +99,69 @@ pub struct FileChange {
     pub hash: Option<String>,
 }
 
-/// Content-hash a file for byte-accurate diffing, or `None` if it's missing, not
-/// a regular file, or larger than [`MAX_HASH_BYTES`].
-pub fn hash_file(path: &Path) -> Option<String> {
+/// Content-hash a file **and** store its bytes in the content-addressed blob
+/// store (deduplicated), returning the hash. `None` if it's missing, not a
+/// regular file, or larger than [`MAX_HASH_BYTES`]. The blob lets `diff`/`cat`
+/// show the file's actual content later.
+pub fn hash_and_store(path: &Path) -> Option<String> {
     let meta = std::fs::metadata(path).ok()?;
     if !meta.is_file() || meta.len() > MAX_HASH_BYTES {
         return None;
     }
     let bytes = std::fs::read(path).ok()?;
-    Some(
-        Sha256::digest(&bytes)
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect(),
-    )
+    let hash: String = Sha256::digest(&bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    if let Ok(dir) = blobs_dir() {
+        let blob = dir.join(&hash);
+        if !blob.exists() {
+            let _ = std::fs::create_dir_all(&dir);
+            let _ = std::fs::write(&blob, &bytes); // best-effort; hash is still useful
+        }
+    }
+    Some(hash)
+}
+
+/// Load a stored blob's bytes by content hash.
+pub fn load_blob(hash: &str) -> Option<Vec<u8>> {
+    std::fs::read(blobs_dir().ok()?.join(hash)).ok()
+}
+
+/// A file's final recorded content within a run — the bytes as of the last step
+/// that wrote it, if that content was stored as a blob.
+pub fn file_content(run: &RunRecord, path: &str) -> Option<Vec<u8>> {
+    let mut hash = None;
+    for step in run.jobs.iter().flat_map(|j| &j.steps) {
+        for f in &step.files {
+            if f.path == path {
+                hash = if f.status == "removed" {
+                    None // last state: the file is gone
+                } else {
+                    f.hash.clone()
+                };
+            }
+        }
+    }
+    load_blob(&hash?)
+}
+
+/// The root of the stepci cache (`~/.cache/stepci`).
+fn cache_home() -> Result<PathBuf> {
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .ok_or_else(|| anyhow::anyhow!("no HOME directory for the stepci cache"))?;
+    Ok(PathBuf::from(home).join(".cache/stepci"))
 }
 
 /// The directory holding all recordings (`~/.cache/stepci/runs`).
 pub fn runs_dir() -> Result<PathBuf> {
-    let home = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .ok_or_else(|| anyhow::anyhow!("no HOME directory for the run store"))?;
-    Ok(PathBuf::from(home).join(".cache/stepci/runs"))
+    Ok(cache_home()?.join("runs"))
+}
+
+/// The content-addressed blob store (`~/.cache/stepci/blobs`).
+pub fn blobs_dir() -> Result<PathBuf> {
+    Ok(cache_home()?.join("blobs"))
 }
 
 /// Write a recording to `~/.cache/stepci/runs/<started_unix_ms>/run.json`, then
@@ -133,6 +174,32 @@ pub fn save(record: &RunRecord) -> Result<()> {
     std::fs::write(dir.join("run.json"), json)
         .with_context(|| format!("writing `{}`", dir.join("run.json").display()))?;
     prune()?;
+    let _ = gc_blobs(); // best-effort; a stale blob is harmless
+    Ok(())
+}
+
+/// Delete blobs no longer referenced by any kept recording (mark-and-sweep over
+/// the ≤ [`MAX_RUNS`] remaining runs).
+fn gc_blobs() -> Result<()> {
+    let dir = blobs_dir()?;
+    if !dir.is_dir() {
+        return Ok(());
+    }
+    let referenced: std::collections::HashSet<String> = list()?
+        .iter()
+        .flat_map(|r| &r.jobs)
+        .flat_map(|j| &j.steps)
+        .flat_map(|s| &s.files)
+        .filter_map(|f| f.hash.clone())
+        .collect();
+    for entry in std::fs::read_dir(&dir)? {
+        let p = entry?.path();
+        if let Some(name) = p.file_name().and_then(|n| n.to_str())
+            && !referenced.contains(name)
+        {
+            let _ = std::fs::remove_file(&p);
+        }
+    }
     Ok(())
 }
 

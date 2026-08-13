@@ -48,6 +48,14 @@ enum Command {
         #[arg(long, default_value = "1")]
         run: usize,
     },
+    /// Trace which steps set an env var or wrote a file in a run (provenance).
+    Why {
+        /// An env var name or a file path (as shown by `show`/`diff`).
+        name: String,
+        /// Which run — 1 is the most recent (the default).
+        #[arg(long, default_value = "1")]
+        run: usize,
+    },
 }
 
 #[derive(Args)]
@@ -96,7 +104,31 @@ fn try_main() -> Result<()> {
         Command::Show { run } => show_run(run),
         Command::Diff { a, b } => diff_runs(a, b),
         Command::Cat { path, run } => cat_file(&path, run),
+        Command::Why { name, run } => why(&name, run),
     }
+}
+
+/// `stepci why <name> [--run n]` — trace which steps produced an env var or file.
+fn why(name: &str, n: usize) -> Result<()> {
+    let Some(r) = record::nth_recent(n)? else {
+        anyhow::bail!("no run #{n} — `stepci runs` lists what's recorded");
+    };
+    let trace = record::trace(&r, name);
+    if trace.is_empty() {
+        println!("Nothing in run #{n} (`{}`) touched `{name}`.", r.workflow);
+        return Ok(());
+    }
+    println!("`{name}` in run #{n} (`{}`):", r.workflow);
+    for e in &trace {
+        println!("  step {} ({}) {}", e.step, e.label, e.effect);
+    }
+    if trace.len() > 1 {
+        println!(
+            "  → touched {} times across the run (the last takes effect)",
+            trace.len()
+        );
+    }
+    Ok(())
 }
 
 /// `stepci cat <path> [--run n]` — print a file's recorded content from a run.

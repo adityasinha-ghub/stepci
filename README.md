@@ -72,6 +72,18 @@ stepci show 3              # re-open the 3rd-most-recent
 stepci diff                # compare the previous run to the latest
 stepci diff 5 1            # compare the 5th-most-recent to the latest
 stepci cat config.yml      # print a file's content as recorded in the latest run
+stepci why VERSION         # which steps set an env var (or wrote a file), in order
+```
+
+`why` traces a value or file to the steps that produced it — and surfaces the
+multi-write footgun (a var set twice shows both, and the last wins):
+
+```
+$ stepci why VERSION
+`VERSION` in run #1 (`ci.yml`):
+  step 1 (Configure) set it to 1.0.0
+  step 3 (Bump for release) changed it 1.0.0 → 2.0.0
+  → touched 2 times across the run (the last takes effect)
 ```
 
 `diff` shows the **actual line-level change** to a file between two runs (not just
@@ -339,6 +351,7 @@ has no inline `#` comments — the whole value after `=` is the secret.
 - [x] Run **recording** — `stepci runs`/`show` re-open a finished run's per-step diffs
 - [x] Run **diff** — `stepci diff` compares two recordings, byte-accurate, with line-level file content diffs
 - [x] Content-addressed **blob store** + `stepci cat` — view a file's recorded content from a past run
+- [x] **Provenance** — `stepci why <var|file>` traces which steps produced a value/file
 - [ ] Materialize a step's *whole* world + single-step re-exec; flake-prover
 
 ## Install

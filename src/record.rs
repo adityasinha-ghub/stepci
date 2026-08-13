@@ -1,13 +1,13 @@
-//! Persist each run as a re-openable **recording** — the per-step diffs and
-//! metadata the executor already computes — so a finished run stops being a log
-//! you scroll past once and becomes a durable object you can list, re-open, and
-//! compare (`stepci runs` / `stepci show` / `stepci diff`).
+//! Persist each run as a re-openable **recording** — so a finished run stops
+//! being a log you scroll past once and becomes a durable object you can list,
+//! re-open, compare, read, and trace (`stepci runs`/`show`/`diff`/`cat`/`why`).
 //!
-//! Each changed *individual* file is content-hashed (SHA-256, under a size cap),
-//! so a diff distinguishes "changed to the same bytes" (a mtime-only touch) from
-//! a real content change. It stores diffs + hashes, not full file *contents* —
-//! full-content checkpoints (to materialize a step's exact world or re-run one
-//! step) are a later milestone.
+//! Each changed *individual* file is content-hashed (SHA-256, under a size cap)
+//! and its bytes stored in a deduplicated content-addressed blob store — so a
+//! diff is byte-accurate and can show the actual line-level change, `cat` can
+//! print a file's recorded content, and `why` can trace a value/file to the
+//! steps that produced it. Whole-workspace checkpoints (to materialize a step's
+//! exact world or re-run one step) are still a later milestone.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -249,6 +249,51 @@ fn prune() -> Result<()> {
     Ok(())
 }
 
+/// One step's effect on a traced env var or file, for `stepci why`.
+#[derive(Debug, Clone)]
+pub struct TraceEntry {
+    pub step: usize,
+    pub label: String,
+    /// What the step did to the name, e.g. `set it to 2.0.0`, `modified it`.
+    pub effect: String,
+}
+
+/// Every step in a run that touched an env var or file `name`, in order — the
+/// provenance/blame timeline (which also reveals multi-writes: a value set twice
+/// shows both, and the last one wins).
+pub fn trace(run: &RunRecord, name: &str) -> Vec<TraceEntry> {
+    let mut out = Vec::new();
+    for step in run.jobs.iter().flat_map(|j| &j.steps) {
+        let mut push = |effect: String| {
+            out.push(TraceEntry {
+                step: step.number,
+                label: step.label.clone(),
+                effect,
+            });
+        };
+        if let Some((_, v)) = step.env_added.iter().find(|(k, _)| k == name) {
+            push(format!("set it to {v}"));
+        }
+        if let Some((_, o, n)) = step.env_changed.iter().find(|(k, _, _)| k == name) {
+            push(format!("changed it {o} → {n}"));
+        }
+        if step.env_removed.iter().any(|k| k == name) {
+            push("removed it from the env".to_string());
+        }
+        if step.path_added.iter().any(|p| p == name) {
+            push("prepended it to PATH".to_string());
+        }
+        for f in step.files.iter().filter(|f| f.path == name) {
+            push(match f.status.as_str() {
+                "added" => "created the file".to_string(),
+                "removed" => "removed the file".to_string(),
+                _ => "modified the file".to_string(),
+            });
+        }
+    }
+    out
+}
+
 /// The human-readable differences between the same step across two runs (empty
 /// if the step behaved identically as far as the recording captured).
 pub fn step_changes(a: &StepRecord, b: &StepRecord) -> Vec<String> {
@@ -433,5 +478,71 @@ mod tests {
 
         // Identical steps → no changes (same status + same hash isn't a diff).
         assert!(step_changes(&a, &a).is_empty());
+    }
+
+    #[test]
+    fn trace_follows_an_env_var_and_a_file_across_steps() {
+        let step = |number: usize, label: &str, s: StepRecord| StepRecord {
+            number,
+            label: label.into(),
+            ..s
+        };
+        let run = RunRecord {
+            format_version: FORMAT_VERSION,
+            stepci_version: "x".into(),
+            workflow: "w".into(),
+            started_unix_ms: 1,
+            exit_code: 0,
+            jobs: vec![JobRecord {
+                id: "j".into(),
+                name: None,
+                matrix: String::new(),
+                status: "success".into(),
+                steps: vec![
+                    step(
+                        1,
+                        "Configure",
+                        StepRecord {
+                            env_added: vec![("VERSION".into(), "1.0.0".into())],
+                            ..Default::default()
+                        },
+                    ),
+                    step(
+                        2,
+                        "Build",
+                        StepRecord {
+                            files: vec![FileChange {
+                                path: "out/app".into(),
+                                status: "added".into(),
+                                ..Default::default()
+                            }],
+                            ..Default::default()
+                        },
+                    ),
+                    step(
+                        3,
+                        "Bump",
+                        StepRecord {
+                            env_changed: vec![("VERSION".into(), "1.0.0".into(), "2.0.0".into())],
+                            ..Default::default()
+                        },
+                    ),
+                ],
+            }],
+        };
+        // VERSION: two writes, in order.
+        let v = trace(&run, "VERSION");
+        assert_eq!(v.len(), 2);
+        assert_eq!((v[0].step, v[0].effect.as_str()), (1, "set it to 1.0.0"));
+        assert_eq!(
+            (v[1].step, v[1].effect.as_str()),
+            (3, "changed it 1.0.0 → 2.0.0")
+        );
+        // A file.
+        let f = trace(&run, "out/app");
+        assert_eq!(f.len(), 1);
+        assert_eq!((f[0].step, f[0].effect.as_str()), (2, "created the file"));
+        // Nothing.
+        assert!(trace(&run, "NOPE").is_empty());
     }
 }

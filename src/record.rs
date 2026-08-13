@@ -249,6 +249,53 @@ fn prune() -> Result<()> {
     Ok(())
 }
 
+/// The result of reconciling a local recording with a real GitHub run.
+#[derive(Debug, Default)]
+pub struct Reconciliation {
+    /// Steps in both that DIFFER: `(name, local_outcome, github_conclusion)`.
+    pub diverged: Vec<(String, String, String)>,
+    /// How many matched steps agreed.
+    pub agreed: usize,
+    /// Step names only in the local run.
+    pub local_only: Vec<String>,
+    /// Step names only on GitHub (e.g. runner setup/teardown).
+    pub github_only: Vec<String>,
+}
+
+/// Compare a local recording's step outcomes to a GitHub run's, matched by step
+/// name across the whole run. This is a coarse, outcome-level comparison —
+/// GitHub's API doesn't expose the env/file diffs stepci records, and duplicate
+/// step names (e.g. across matrix combinations) collapse.
+pub fn reconcile(local: &RunRecord, github: &[(String, String)]) -> Reconciliation {
+    let local_map: std::collections::BTreeMap<&str, &str> = local
+        .jobs
+        .iter()
+        .flat_map(|j| &j.steps)
+        .map(|s| (s.label.as_str(), s.outcome.as_str()))
+        .collect();
+    let gh_map: std::collections::BTreeMap<&str, &str> = github
+        .iter()
+        .map(|(n, c)| (n.as_str(), c.as_str()))
+        .collect();
+
+    let mut r = Reconciliation::default();
+    for (name, lo) in &local_map {
+        match gh_map.get(name) {
+            Some(gc) if lo == gc => r.agreed += 1,
+            Some(gc) => r
+                .diverged
+                .push((name.to_string(), lo.to_string(), gc.to_string())),
+            None => r.local_only.push(name.to_string()),
+        }
+    }
+    for name in gh_map.keys() {
+        if !local_map.contains_key(name) {
+            r.github_only.push(name.to_string());
+        }
+    }
+    r
+}
+
 /// One step's effect on a traced env var or file, for `stepci why`.
 #[derive(Debug, Clone)]
 pub struct TraceEntry {
@@ -544,5 +591,41 @@ mod tests {
         assert_eq!((f[0].step, f[0].effect.as_str()), (2, "created the file"));
         // Nothing.
         assert!(trace(&run, "NOPE").is_empty());
+    }
+
+    #[test]
+    fn reconcile_flags_outcome_divergences() {
+        let s = |label: &str, outcome: &str| StepRecord {
+            label: label.into(),
+            outcome: outcome.into(),
+            ..Default::default()
+        };
+        let local = RunRecord {
+            format_version: FORMAT_VERSION,
+            stepci_version: "x".into(),
+            workflow: "w".into(),
+            started_unix_ms: 1,
+            exit_code: 0,
+            jobs: vec![JobRecord {
+                id: "j".into(),
+                name: None,
+                matrix: String::new(),
+                status: "success".into(),
+                steps: vec![s("Build", "success"), s("Deploy", "success")],
+            }],
+        };
+        let github = vec![
+            ("Set up job".to_string(), "success".to_string()),
+            ("Build".to_string(), "success".to_string()),
+            ("Deploy".to_string(), "failure".to_string()),
+        ];
+        let r = reconcile(&local, &github);
+        assert_eq!(
+            r.diverged,
+            vec![("Deploy".into(), "success".into(), "failure".into())]
+        );
+        assert_eq!(r.agreed, 1); // Build
+        assert_eq!(r.github_only, vec!["Set up job".to_string()]);
+        assert!(r.local_only.is_empty());
     }
 }

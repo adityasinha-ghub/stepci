@@ -73,7 +73,24 @@ stepci diff                # compare the previous run to the latest
 stepci diff 5 1            # compare the 5th-most-recent to the latest
 stepci cat config.yml      # print a file's content as recorded in the latest run
 stepci why VERSION         # which steps set an env var (or wrote a file), in order
+stepci reconcile 123456    # compare the latest local run to a real GitHub run
 ```
+
+**Passes here, fails in CI?** `stepci reconcile <github-run-id>` compares a local
+run to a real GitHub Actions run (via the `gh` CLI), matched by step name — so
+you see exactly which step diverged:
+
+```
+$ stepci reconcile 31749774721
+  ✗ Build: failure locally, success on GitHub
+  (3 matched steps agreed)
+  ⚠ stepci runs natively on your host, not a fresh GitHub runner — a
+    divergence may be that difference, not your workflow.
+```
+
+It's a coarse, outcome-level comparison (GitHub's API doesn't expose the env/file
+diffs stepci records), and it honestly flags that a difference may be stepci's own
+[fidelity gap](#known-executor-gaps-v0) rather than your workflow.
 
 `why` traces a value or file to the steps that produced it — and surfaces the
 multi-write footgun (a var set twice shows both, and the last wins):
@@ -352,6 +369,7 @@ has no inline `#` comments — the whole value after `=` is the secret.
 - [x] Run **diff** — `stepci diff` compares two recordings, byte-accurate, with line-level file content diffs
 - [x] Content-addressed **blob store** + `stepci cat` — view a file's recorded content from a past run
 - [x] **Provenance** — `stepci why <var|file>` traces which steps produced a value/file
+- [x] **Reconcile** — `stepci reconcile <github-run>` compares a local run to a real GitHub run
 - [ ] Materialize a step's *whole* world + single-step re-exec; flake-prover
 
 ## Install

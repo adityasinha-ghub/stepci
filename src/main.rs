@@ -56,6 +56,36 @@ enum Command {
         #[arg(long, default_value = "1")]
         run: usize,
     },
+    /// Compare a local run to a real GitHub Actions run (needs the `gh` CLI).
+    Reconcile {
+        /// The GitHub Actions run id (from the run's URL, or `gh run list`).
+        github_run: String,
+        /// Which local run — 1 is the most recent (the default).
+        #[arg(long, default_value = "1")]
+        run: usize,
+        /// The repo (`owner/name`) if not the current directory's.
+        #[arg(long, short = 'R')]
+        repo: Option<String>,
+    },
+}
+
+/// A subset of `gh run view --json jobs` output.
+#[derive(serde::Deserialize)]
+struct GhRun {
+    #[serde(default)]
+    jobs: Vec<GhJob>,
+}
+#[derive(serde::Deserialize)]
+struct GhJob {
+    #[serde(default)]
+    steps: Vec<GhStep>,
+}
+#[derive(serde::Deserialize)]
+struct GhStep {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    conclusion: String,
 }
 
 #[derive(Args)]
@@ -105,7 +135,90 @@ fn try_main() -> Result<()> {
         Command::Diff { a, b } => diff_runs(a, b),
         Command::Cat { path, run } => cat_file(&path, run),
         Command::Why { name, run } => why(&name, run),
+        Command::Reconcile {
+            github_run,
+            run,
+            repo,
+        } => reconcile_run(&github_run, run, repo.as_deref()),
     }
+}
+
+/// `stepci reconcile <github-run-id>` — compare a local run's step outcomes to a
+/// real GitHub run's (matched by step name).
+fn reconcile_run(github_run: &str, n: usize, repo: Option<&str>) -> Result<()> {
+    let local = record::nth_recent(n)?.ok_or_else(|| {
+        anyhow::anyhow!("no local run #{n} — `stepci runs` lists what's recorded")
+    })?;
+    let gh = fetch_github_run(github_run, repo)?;
+    let gh_steps: Vec<(String, String)> = gh
+        .jobs
+        .iter()
+        .flat_map(|j| &j.steps)
+        .map(|s| {
+            let conclusion = if s.conclusion.is_empty() {
+                "skipped".to_string()
+            } else {
+                s.conclusion.clone()
+            };
+            (s.name.clone(), conclusion)
+        })
+        .collect();
+
+    let r = record::reconcile(&local, &gh_steps);
+    println!(
+        "Reconciling local run #{n} (`{}`) with GitHub run {github_run}:",
+        local.workflow
+    );
+    if r.diverged.is_empty() {
+        println!(
+            "  ✓ every matched step agreed ({} step{}).",
+            r.agreed,
+            if r.agreed == 1 { "" } else { "s" }
+        );
+    } else {
+        for (name, lo, gc) in &r.diverged {
+            println!("  ✗ {name}: {lo} locally, {gc} on GitHub");
+        }
+        println!(
+            "  ({} matched step{} agreed)",
+            r.agreed,
+            if r.agreed == 1 { "" } else { "s" }
+        );
+    }
+    if !r.local_only.is_empty() {
+        println!("  ran only locally: {}", r.local_only.join(", "));
+    }
+    if !r.github_only.is_empty() {
+        println!(
+            "  ran only on GitHub (runner setup/teardown, or steps stepci skipped): {}",
+            r.github_only.join(", ")
+        );
+    }
+    println!(
+        "\n  ⚠ stepci runs natively on your host, not a fresh GitHub runner — a\n  \
+         divergence may be that difference (host env, tool versions, no isolation,\n  \
+         localhost services, near-empty github.event), not your workflow."
+    );
+    Ok(())
+}
+
+/// Fetch a GitHub run's jobs/steps via the `gh` CLI.
+fn fetch_github_run(id: &str, repo: Option<&str>) -> Result<GhRun> {
+    let mut cmd = std::process::Command::new("gh");
+    cmd.args(["run", "view", id, "--json", "jobs"]);
+    if let Some(r) = repo {
+        cmd.args(["-R", r]);
+    }
+    let out = cmd
+        .output()
+        .map_err(|e| anyhow::anyhow!("failed to run `gh` (is the GitHub CLI installed?): {e}"))?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "`gh run view {id}` failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    serde_json::from_slice(&out.stdout).context("parsing `gh run view` JSON")
 }
 
 /// `stepci why <name> [--run n]` — trace which steps produced an env var or file.
